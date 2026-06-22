@@ -1,5 +1,6 @@
 VIDEOS/
-Extraceted Data/
+Extraceted Data/extracted_faces
+Extraceted Data/videos
 BALANCED_LABELS/
 LABELS/
 ATTENDENCE RESULTS/
@@ -12,5 +13,3 @@ Results/
 *.jpg
 *.bin
 *.pt
-clustering.py 
-extract_faces.py
