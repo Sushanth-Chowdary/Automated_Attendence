@@ -45,7 +45,7 @@ target_names = saved_data['target_names']
 
 # 4. Define Parameters & Setup Batch Processing
 CONFIDENCE_THRESHOLD = 0.90
-REQUIRED_FRAMES_TO_ATTEND = 200 
+REQUIRED_FRAMES_TO_ATTEND = 190 
 FRAME_SKIP = 1                 
 
 input_dir = 'VIDEOS'

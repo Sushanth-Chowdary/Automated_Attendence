@@ -115,7 +115,7 @@ y_real = saved_data['y_real']
 CONFIDENCE_THRESHOLD = 0.88  
 FRAME_SKIP = 3                
 FRAMES_PER_VOTE = 5          
-REQUIRED_VOTES = 21           
+REQUIRED_VOTES = 20           
 
 input_dir = 'VIDEOS'
 output_dir = 'ATTENDENCE RESULTS/MINE'
