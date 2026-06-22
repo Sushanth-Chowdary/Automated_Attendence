@@ -1,0 +1,19 @@
+# Deep Learning Core
+torch
+torchvision
+
+# Vision & Inference
+ultralytics
+facenet-pytorch
+opencv-python
+Pillow
+
+# Data Processing & Indexing
+numpy
+pandas
+faiss-gpu   # Change to faiss-cpu if you hit installation errors
+
+# Tracking & Video Utils
+deep-sort-realtime
+imutils
+tqdm

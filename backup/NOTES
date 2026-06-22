@@ -1,0 +1,43 @@
+2026-04-07_09.18.02.mkv  _ medium 24
+
+video2.mkv _ medium
+
+2026-02-25_11.21.17.mkv _ small 12
+
+2026-03-09_10.04.35.mkv _ samll
+
+2026-04-27_10.02.44.mkv _ large
+
+2026-02-25_11.23.07.mkv _ large
+
+2026-02-25_11.03.43.mkv _ small
+
+2026-02-18_11.02.03.mkv _ small
+
+video1_uajX8qg0.mp4 _ medium
+
+2026-02-25_11.00.04.mkv _ medium
+
+2026-03-05_11.02.28.mkv _ large
+
+2026-03-09_10.03.16.mkv _ large
+
+2026-02-25_11.15.41.mkv _ samll
+
+2026-03-02_09.55.37.mkv _ small
+
+
+
+
+confidience threshold thershold = 90%
+and 
+supervised learning using mtcnn
+and 
+changed classifer to keras fnn from mlp skt learn
+and
+no clustering
+and
+using the same inceptionresnetv1 instead of ------
+and 
+more data for the missclassfied
+

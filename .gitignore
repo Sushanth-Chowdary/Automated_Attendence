@@ -1,0 +1,14 @@
+VIDEOS/
+Extraceted Data/
+BALANCED_LABELS/
+LABELS/
+ATTENDENCE RESULTS/
+Clusters and Similarity/
+Results/
+*.csv
+*.xlsx
+*.pkl
+*.keras
+*.jpg
+*.bin
+*.pt

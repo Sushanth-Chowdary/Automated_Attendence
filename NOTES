@@ -1,0 +1,107 @@
+2026-04-07_09.18.02.mkv  _ medium 24
+
+video2.mkv _ medium
+
+2026-02-25_11.21.17.mkv _ small 12
+
+2026-03-09_10.04.35.mkv _ samll
+
+2026-04-27_10.02.44.mkv _ large
+
+2026-02-25_11.23.07.mkv _ large
+
+2026-02-25_11.03.43.mkv _ small
+
+2026-02-18_11.02.03.mkv _ small
+
+video1_uajX8qg0.mp4 _ medium
+
+2026-02-25_11.00.04.mkv _ medium
+
+2026-03-05_11.02.28.mkv _ large
+
+2026-03-09_10.03.16.mkv _ large
+
+2026-02-25_11.15.41.mkv _ samll
+
+2026-03-02_09.55.37.mkv _ small
+
+
+
+clahe
+improvements for the faster result 
+asyconous video1
+small improvements
+
+bounding boxes
+
+
+
+
+
+
+
+
+
+It looks like you've shared the exact design discussion and logic blueprint that led to your current script!
+
+The great news is that the test.py file you uploaded in your previous message already has all of these changes perfectly implemented. You successfully translated that entire conversation into your working code.
+
+Here is exactly where you already nailed these features in your test.py script:
+1. The Custom Trackers
+
+You successfully separated the spatial tracking from the identity logic right before your progress bar loop (Lines 111-112):
+Python
+
+track_visibility = {}  
+track_identities = {} 
+
+2. The "Ghosting" Background Math
+
+You correctly set up the else block during skipped frames to feed empty arrays to DeepSORT. This keeps the Kalman filter guessing in the dark without breaking its internal clock (Line 143):
+Python
+
+else:
+    # Skipped Frames: Feed EMPTY detections to keep Kalman filter running
+    tracks = tracker.update_tracks([], frame=frame)
+
+3. The Strict Visibility Toggle
+
+Inside your keyframe logic, you enforce exactly when a box is allowed to exist visually. If MTCNN confirms the face, it stays visible. If MTCNN misses it, it instantly hides (Lines 159 & 180):
+Python
+
+if track.time_since_update == 0:
+    track_visibility[t_id] = True
+    # ... (Face extraction logic) ...
+else:
+    # MTCNN ran, but this specific person was NOT detected. Instantly hide.
+    track_visibility[t_id] = False
+
+4. The Identity Merge (Fixing "Unknown")
+
+You built the override beautifully. Once your rolling buffer votes and finds a real name, it updates track_identities, overwriting any confused DeepSORT IDs (Lines 204-205):
+Python
+
+if t_id not in track_identities or winner != "Unknown":
+    track_identities[t_id] = winner
+
+5. The Drawing Gatekeeper
+
+Your final drawing loop strictly checks your custom visibility dictionary before it ever touches cv2.rectangle (Line 214):
+Python
+
+# Strictly enforce our custom visibility rule
+if track_visibility.get(t_id, False) == True:
+
+You’ve already built exactly what you set out to build in that conversation. Since this logic is already actively living inside your test.py script, are you currently running into any specific bugs or flickering with the bounding boxes, or were you just sharing the design context behind your architecture?
+
+
+
+
+https://github.com/Sushanth-Chowdary/Automated_Attendence
+https://github.com/keras-team/keras/issues/9214
+https://github.com/facebookresearch/faiss
+https://yolov8.com/
+https://github.com/ultralytics/ultralytics
+
+
