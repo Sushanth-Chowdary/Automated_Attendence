@@ -14,9 +14,60 @@ import shutil
 from tqdm import tqdm  
 from collections import Counter
 import faiss
+import threading
+import queue
 
 # Tracker Import
 from deep_sort_realtime.deepsort_tracker import DeepSort
+
+# ==========================================
+# THREADED VIDEO I/O HELPER
+# ==========================================
+class ThreadedVideoReader:
+    def __init__(self, path, queue_size=128):
+        # Initialize standard capture
+        self.cap = cv2.VideoCapture(path)
+        
+        # Get video properties right away so we can use them later
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # The Queue is our "waiting line" for frames
+        self.q = queue.Queue(maxsize=queue_size)
+        self.stopped = False
+
+    def start(self):
+        # Start the background thread
+        t = threading.Thread(target=self.update, args=())
+        t.daemon = True
+        t.start()
+        return self
+
+    def update(self):
+        # This loop runs constantly in the background
+        while not self.stopped:
+            # If the queue is full, wait. Otherwise, grab a frame.
+            if not self.q.full():
+                ret, frame = self.cap.read()
+                if not ret:
+                    self.stopped = True
+                    return
+                # Put the frame in the line
+                self.q.put(frame)
+
+    def read(self):
+        # The main script calls this to instantly grab the next ready frame
+        return self.q.get()
+
+    def more(self):
+        # Check if there are still frames left
+        return self.q.qsize() > 0 or not self.stopped
+
+    def stop(self):
+        self.stopped = True
+        self.cap.release()
 
 # ==========================================
 # ALIGNMENT HELPER FUNCTIONS
@@ -153,6 +204,7 @@ for video_filename in video_files:
     print(f"Starting processing for: {video_filename}")
     print(f"{'='*50}")
     
+    # [FIXED] Initialize tracker here so it gets a clean memory for every video
     tracker = DeepSort(max_age=10, n_init=3, embedder_gpu=True, half=True)
 
     network_input_path = os.path.join(input_dir, video_filename)
@@ -173,13 +225,14 @@ for video_filename in video_files:
         print(f"Error copying input video locally: {e}")
         continue
 
-    # Use standard cv2.VideoCapture to avoid memory leaks
-    cap = cv2.VideoCapture(local_input_path)
+    # [FIXED] Start the threaded video reader
+    video_stream = ThreadedVideoReader(local_input_path, queue_size=128).start()
     
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) 
+    # Grab properties directly from our new class
+    frame_width = video_stream.frame_width
+    frame_height = video_stream.frame_height
+    fps = video_stream.fps
+    total_frames = video_stream.total_frames
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(temp_local_path, fourcc, fps, (frame_width, frame_height))
@@ -196,11 +249,11 @@ for video_filename in video_files:
     print(f"[2/4] Processing frames...")
     try:
         with tqdm(total=total_frames, desc="Processing Video", unit="frame") as pbar:
-            while cap.isOpened():
-                ret, frame = cap.read()
+            # [FIXED] Update loop condition to check the stream queue
+            while video_stream.more():
+                frame = video_stream.read()
                 
-                # Break if video ends or cannot read frame
-                if not ret or frame is None:
+                if frame is None:
                     break 
 
                 is_keyframe = (frame_count % FRAME_SKIP == 0)
@@ -354,9 +407,9 @@ for video_filename in video_files:
     finally:
         print(f"\n[3/4] Forcing release of resources...")
         
-        # Ensure capture object is properly released
-        if 'cap' in locals() and cap.isOpened():
-            cap.release()
+        # [FIXED] Stop the background thread and release capture properly
+        if 'video_stream' in locals():
+            video_stream.stop()
             
         if out is not None:
             out.release()
