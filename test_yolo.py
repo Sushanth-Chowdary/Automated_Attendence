@@ -145,8 +145,8 @@ def align_face(img, box, keypoints):
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Running on device: {device}")
 
-yolo_model = YOLO('yolov8n-face.pt')
-yolo_model.to(device)
+# --- UPDATED TO USE TENSORRT ENGINE ---
+yolo_model = YOLO('yolov8n-face.engine', task='detect')
 
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device).half()
 
