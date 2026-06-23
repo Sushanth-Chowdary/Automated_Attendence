@@ -118,7 +118,8 @@ FRAMES_PER_VOTE = 5
 REQUIRED_VOTES = 20           
 
 input_dir = 'VIDEOS'
-output_dir = 'ATTENDENCE RESULTS/MINE'
+# [FIXED] Converted to absolute path to prevent network drive context loss
+output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
 
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
@@ -390,12 +391,27 @@ for video_filename in video_files:
             
         pd.DataFrame(debug_records).to_csv(debug_csv_path, index=False)
 
+        # [FIXED] Failsafe implemented for network drive disconnects
         if os.path.exists(temp_local_path):
             print(f"      Copying processed video back to output folder: {final_network_path}")
+            
+            # 1. Force directory recreation/verification right before saving
+            # This wakes up the network drive and ensures the path exists
+            os.makedirs(os.path.dirname(final_network_path), exist_ok=True)
+            
             try:
-                shutil.copyfile(temp_local_path, final_network_path) # <--- Fixed!
+                shutil.copyfile(temp_local_path, final_network_path) 
             except Exception as e:
                 print(f"      [!] Failed to copy output video back: {e}")
+                
+                # 2. THE FAILSAFE: Rescue the file to your local home directory
+                rescue_path = os.path.join(os.path.expanduser('~'), f"RESCUED_{video_output_filename}")
+                print(f"      [!] Rescuing file to local drive: {rescue_path}")
+                try:
+                    shutil.copyfile(temp_local_path, rescue_path)
+                    print("      [+] File successfully rescued to your local home folder.")
+                except Exception as rescue_e:
+                    print(f"      [!] Failsafe failed: {rescue_e}")
 
         print(f"[4/4] Cleaning up temporary /tmp/ files...")
         try:
