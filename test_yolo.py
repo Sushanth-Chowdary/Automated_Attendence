@@ -48,14 +48,14 @@ class ThreadedVideoReader:
     def update(self):
         # This loop runs constantly in the background
         while not self.stopped:
-            # If the queue is full, wait. Otherwise, grab a frame.
-            if not self.q.full():
-                ret, frame = self.cap.read()
-                if not ret:
-                    self.stopped = True
-                    return
-                # Put the frame in the line
-                self.q.put(frame)
+            ret, frame = self.cap.read()
+            if not ret:
+                self.stopped = True
+                return
+            
+            # .put() naturally blocks/pauses the thread if the queue is at maxsize (128).
+            # This prevents the CPU from spinning infinitely and locking up the script!
+            self.q.put(frame)
 
     def read(self):
         # The main script calls this to instantly grab the next ready frame
