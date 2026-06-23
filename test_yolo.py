@@ -98,7 +98,6 @@ yolo_model = YOLO('yolov8n-face.pt')
 yolo_model.to(device)
 
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device).half()
-tracker = DeepSort(max_age=10, n_init=3, embedder_gpu=True, half=True)
 
 # 3. Load the FAISS Index and Mappings
 faiss_index_path = './face_attendance_faiss.bin'
@@ -154,6 +153,8 @@ for video_filename in video_files:
     print(f"Starting processing for: {video_filename}")
     print(f"{'='*50}")
     
+    tracker = DeepSort(max_age=10, n_init=3, embedder_gpu=True, half=True)
+
     network_input_path = os.path.join(input_dir, video_filename)
     file_name_no_ext, _ = os.path.splitext(video_filename)
     
