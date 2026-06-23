@@ -95,11 +95,12 @@ def align_face(img, box, keypoints):
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Running on device: {device}")
 
-# --- UPDATED TO USE TENSORRT ENGINE ---
+# Using the optimized TensorRT engine
 yolo_model = YOLO('yolov8n-face.engine', task='detect') 
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
 dataset_path = './LABELS'
+BATCH_SIZE = 32  # <-- NEW: How many faces to send to the GPU at once
 
 to_tensor = transforms.Compose([
     transforms.Resize((160, 160)),
@@ -107,7 +108,7 @@ to_tensor = transforms.Compose([
 ])
 
 # ==========================================
-# PHASE 1: Smart Extract & Save Embeddings
+# PHASE 1: Smart Extract & Save Embeddings (BATCHED)
 # ==========================================
 print("\n--- PHASE 1: Extracting and Saving Embeddings ---")
 
@@ -139,7 +140,9 @@ for person_name in os.listdir(dataset_path):
         if not needs_processing:
             continue
 
+        valid_face_tensors = []  # <-- NEW: Store tensors here before passing to network
         person_embeddings = []
+        
         for image_name in image_files:
             image_path = os.path.join(person_dir, image_name)
             try:
@@ -166,25 +169,40 @@ for person_name in os.listdir(dataset_path):
                 # Align and crop the face
                 face_crop_bgr = align_face(img_cv2, box, kpts)
                 
-                # --- NEW QUALITY GATE ---
+                # Quality Gate
                 sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
                 if sharpness < 50.0:
                     print(f"  -> Skipping {image_name}: Too blurry (Sharpness: {sharpness:.1f})")
                     continue
-                # ------------------------
                 
                 # Convert back to format FaceNet expects
                 face_crop_rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
                 face_crop_pil = Image.fromarray(face_crop_rgb)
                 
-                face = to_tensor(face_crop_pil).unsqueeze(0).to(device)
+                # Format tensor but DO NOT run through network yet
+                face = to_tensor(face_crop_pil).unsqueeze(0)
                 face = (face - 0.5) * 2
-
-                embedding = resnet(face).detach().cpu().numpy()[0]
-                person_embeddings.append(embedding)
+                
+                valid_face_tensors.append(face) # Add to our holding list
 
             except Exception as e:
                 print(f"  -> Failed on image {image_name}: {e}")
+
+        # --- NEW: BATCH PROCESSING LOGIC ---
+        if valid_face_tensors:
+            # Process the collected tensors in chunks to prevent GPU memory overload
+            for i in range(0, len(valid_face_tensors), BATCH_SIZE):
+                batch = valid_face_tensors[i:i + BATCH_SIZE]
+                
+                # Combine the list of single tensors into one big batch tensor and send to GPU
+                batch_tensor = torch.cat(batch, dim=0).to(device)
+                
+                # Pass the whole batch through the network at once
+                with torch.no_grad():
+                    batch_embs = resnet(batch_tensor).detach().cpu().numpy()
+                
+                # Add the resulting array of embeddings to our person's list
+                person_embeddings.extend(batch_embs)
 
         if person_embeddings:
             df = pd.DataFrame(person_embeddings)
