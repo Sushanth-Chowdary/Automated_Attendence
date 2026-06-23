@@ -27,13 +27,34 @@ video1_uajX8qg0.mp4 _ medium
 2026-03-02_09.55.37.mkv _ small
 
 
-
+threshold =0.84
 clahe
 improvements for the faster result 
 asyconous video1
 small improvements
 
-bounding boxes
+
+
+
+
+
+
+3. Upgrade from PyTorch (.pt) to TensorRT (.engine)
+
+The Problem: You are running the standard PyTorch weights (yolov8n-face.pt). While fast, PyTorch is fundamentally a research framework with some overhead.
+The Fix: Since you have an NVIDIA GPU, you can export that YOLO model into a TensorRT engine. TensorRT specifically optimizes the neural network architecture for your exact RTX A4000 chip. You literally just run yolo export model=yolov8n-face.pt format=engine half=True in your terminal, and load the resulting .engine file in your code.
+
+    Impact: Usually provides a 2x to 4x speedup for YOLO inference with zero loss in accuracy.
+
+4. Batch Processing in train_yolo.py
+
+The Problem: Your training script loops through your dataset images one by one, sending a single face to the GPU at a time (unsqueeze(0)). GPUs hate single tasks; they love bulk work.
+The Fix: When processing a person's folder, gather all the cropped faces into a list, run torch.cat() to combine them into one batch (just like you do in your testing script!), and send them through FaceNet all at once.
+
+    Impact: Your database building/updating phase will finish in seconds rather than minutes.
+
+
+
 
 
 
