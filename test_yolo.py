@@ -1,6 +1,5 @@
 # 1. Imports
 import torch
-torch.cuda.set_per_process_memory_fraction(0.5, 0)
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
 import torchvision.transforms as transforms
@@ -21,8 +20,6 @@ import queue
 # Tracker Import
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
-
-torch.cuda.set_per_process_memory_fraction(0.5, 0)
 # ==========================================
 # THREADED VIDEO I/O HELPER
 # ==========================================
@@ -149,7 +146,8 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Running on device: {device}")
 
 # --- UPDATED TO USE TENSORRT ENGINE ---
-yolo_model = YOLO('yolov8n-face.engine', task='detect')
+# Change this back
+yolo_model = YOLO('yolov8n-face.pt', task='detect')
 
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device).half()
 
