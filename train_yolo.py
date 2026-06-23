@@ -165,6 +165,13 @@ for person_name in os.listdir(dataset_path):
                 # Align and crop the face
                 face_crop_bgr = align_face(img_cv2, box, kpts)
                 
+                # --- NEW QUALITY GATE ---
+                sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
+                if sharpness < 50.0:
+                    print(f"  -> Skipping {image_name}: Too blurry (Sharpness: {sharpness:.1f})")
+                    continue
+                # ------------------------
+                
                 # Convert back to format FaceNet expects
                 face_crop_rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
                 face_crop_pil = Image.fromarray(face_crop_rgb)
