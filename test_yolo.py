@@ -168,7 +168,6 @@ FRAMES_PER_VOTE = 5
 REQUIRED_VOTES = 20           
 
 input_dir = 'VIDEOS'
-# [FIXED] Converted to absolute path to prevent network drive context loss
 output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
 
 if not os.path.exists(output_dir):
@@ -204,7 +203,6 @@ for video_filename in video_files:
     print(f"Starting processing for: {video_filename}")
     print(f"{'='*50}")
     
-    # [FIXED] Initialize tracker here so it gets a clean memory for every video
     tracker = DeepSort(max_age=10, n_init=3, embedder_gpu=True, half=True)
 
     network_input_path = os.path.join(input_dir, video_filename)
@@ -225,10 +223,8 @@ for video_filename in video_files:
         print(f"Error copying input video locally: {e}")
         continue
 
-    # [FIXED] Start the threaded video reader
     video_stream = ThreadedVideoReader(local_input_path, queue_size=128).start()
     
-    # Grab properties directly from our new class
     frame_width = video_stream.frame_width
     frame_height = video_stream.frame_height
     fps = video_stream.fps
@@ -249,7 +245,6 @@ for video_filename in video_files:
     print(f"[2/4] Processing frames...")
     try:
         with tqdm(total=total_frames, desc="Processing Video", unit="frame") as pbar:
-            # [FIXED] Update loop condition to check the stream queue
             while video_stream.more():
                 frame = video_stream.read()
                 
@@ -263,7 +258,6 @@ for video_filename in video_files:
                 boxes = results[0].boxes.xyxy.cpu().numpy()
                 confs = results[0].boxes.conf.cpu().numpy()
                 
-                # Extract keypoints if available for alignment mapping
                 raw_kpts = results[0].keypoints.xy.cpu().numpy() if hasattr(results[0], 'keypoints') and results[0].keypoints is not None else None
                     
                 detections = []
@@ -299,7 +293,6 @@ for video_filename in video_files:
                             if (x2 - x1) < 50 or (y2 - y1) < 50: 
                                 continue
 
-                            # Map the smoothed track box back to the closest raw YOLO keypoint
                             best_kpt = None
                             if raw_kpts is not None and len(boxes) > 0:
                                 txc, tyc = (x1 + x2) / 2, (y1 + y2) / 2
@@ -310,14 +303,18 @@ for video_filename in video_files:
                                     if dist < min_dist:
                                         min_dist = dist
                                         best_kpt = raw_kpts[i]
-                                # Discard if the closest raw box is too far away (e.g. tracking anomaly)
                                 if min_dist > 2500: 
                                     best_kpt = None
 
                             try:
-                                # Execute alignment
                                 face_crop_bgr = align_face(frame, track_box, best_kpt)
                                 
+                                # --- NEW QUALITY GATE ---
+                                sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
+                                if sharpness < 50.0:
+                                    continue  # Skip this blurry face
+                                # ------------------------
+
                                 face_crop_rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
                                 face_crop_pil = Image.fromarray(face_crop_rgb)
                                 
@@ -347,7 +344,6 @@ for video_filename in video_files:
                             matched_faiss_row = indices[i][0]
                             predicted_label_index = y_real[matched_faiss_row]
                             
-                            # Using the strictly increased threshold
                             if similarity_score > CONFIDENCE_THRESHOLD:
                                 predicted_name = target_names[predicted_label_index]
                             else:
@@ -407,7 +403,6 @@ for video_filename in video_files:
     finally:
         print(f"\n[3/4] Forcing release of resources...")
         
-        # [FIXED] Stop the background thread and release capture properly
         if 'video_stream' in locals():
             video_stream.stop()
             
@@ -445,12 +440,9 @@ for video_filename in video_files:
             
         pd.DataFrame(debug_records).to_csv(debug_csv_path, index=False)
 
-        # [FIXED] Failsafe implemented for network drive disconnects
         if os.path.exists(temp_local_path):
             print(f"      Copying processed video back to output folder: {final_network_path}")
             
-            # 1. Force directory recreation/verification right before saving
-            # This wakes up the network drive and ensures the path exists
             os.makedirs(os.path.dirname(final_network_path), exist_ok=True)
             
             try:
@@ -458,7 +450,6 @@ for video_filename in video_files:
             except Exception as e:
                 print(f"      [!] Failed to copy output video back: {e}")
                 
-                # 2. THE FAILSAFE: Rescue the file to your local home directory
                 rescue_path = os.path.join(os.path.expanduser('~'), f"RESCUED_{video_output_filename}")
                 print(f"      [!] Rescuing file to local drive: {rescue_path}")
                 try:
