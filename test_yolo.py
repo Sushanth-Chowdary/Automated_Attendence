@@ -20,6 +20,8 @@ import queue
 # Tracker Import
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
+
+torch.cuda.set_per_process_memory_fraction(0.5, 0)
 # ==========================================
 # THREADED VIDEO I/O HELPER
 # ==========================================
