@@ -162,7 +162,7 @@ target_names = saved_data['target_names']
 y_real = saved_data['y_real']
 
 # 4. Define Parameters
-CONFIDENCE_THRESHOLD = 0.88  
+CONFIDENCE_THRESHOLD = 0.84 
 FRAME_SKIP = 3                
 FRAMES_PER_VOTE = 5          
 REQUIRED_VOTES = 20           
