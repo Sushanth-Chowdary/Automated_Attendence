@@ -1,5 +1,6 @@
 # 1. Imports
 import torch
+torch.cuda.set_per_process_memory_fraction(0.5, 0)
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
 import torchvision.transforms as transforms
