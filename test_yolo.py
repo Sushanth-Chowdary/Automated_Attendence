@@ -114,8 +114,8 @@ y_real = saved_data['y_real']
 
 # 4. Define Parameters
 CONFIDENCE_THRESHOLD = 0.80  # Lowered to accommodate unaligned faces
-FRAME_SKIP = 3                
-FRAMES_PER_VOTE = 5          
+FRAME_SKIP = 2                
+FRAMES_PER_VOTE = 8          
 REQUIRED_VOTES = 20           
 
 input_dir = 'VIDEOS'
@@ -219,7 +219,7 @@ for video_filename in video_files:
                     
                 detections = []
                 for box, prob in zip(boxes, confs):
-                    if prob > 0.70: # Raised to 0.70 to prevent hallucination lag
+                    if prob > 0.80: # Raised to 0.70 to prevent hallucination lag
                         x1, y1, x2, y2 = map(int, box)
                         w, h = x2 - x1, y2 - y1
                         
@@ -262,7 +262,7 @@ for video_filename in video_files:
                                 
                             # Blur check - Loosened to prevent "Analyzing..." limbo
                             sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
-                            if sharpness < 15.0:
+                            if sharpness < 10.0:
                                 continue  
                                 
                             try:
