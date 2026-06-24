@@ -18,6 +18,7 @@ import threading
 import queue
 import gc
 import time 
+import subprocess # <-- Required for native OS file transfers
 
 # Tracker Import
 from deep_sort_realtime.deepsort_tracker import DeepSort
@@ -97,7 +98,6 @@ def crop_standard(img, box):
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Running on device: {device}")
 
-# We no longer need keypoints, making YOLO run slightly faster!
 yolo_model = YOLO('yolov8n-face.pt', task='detect')
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device).half()
 
@@ -113,7 +113,7 @@ target_names = saved_data['target_names']
 y_real = saved_data['y_real']
 
 # 4. Define Parameters
-CONFIDENCE_THRESHOLD = 0.84 
+CONFIDENCE_THRESHOLD = 0.80  # Lowered to accommodate unaligned faces
 FRAME_SKIP = 3                
 FRAMES_PER_VOTE = 5          
 REQUIRED_VOTES = 20           
@@ -159,23 +159,19 @@ for video_filename in video_files:
     network_input_path = os.path.join(input_dir, video_filename)
     file_name_no_ext, _ = os.path.splitext(video_filename)
     
-    # --- CHANGED: Writing entirely to the local working directory ---
-    local_input_path = f"./input_{video_filename}"
-    video_output_filename = f"{file_name_no_ext}_output.mp4"
-    temp_local_path = f"./temp_{video_output_filename}" 
+    # LOCAL temporary paths (Writing directly to your Ubuntu machine)
+    temp_local_vid = f"./temp_{video_output_filename}" 
+    temp_local_att_csv = f"./temp_{file_name_no_ext}_output.csv"
+    temp_local_dbg_csv = f"./temp_{file_name_no_ext}_DEBUG_Tracks.csv"
     
-    final_network_path = os.path.join(output_dir, video_output_filename)
-    attendance_csv_path = os.path.join(output_dir, f"{file_name_no_ext}_output.csv")
-    debug_csv_path = os.path.join(output_dir, f"{file_name_no_ext}_DEBUG_Tracks.csv")
+    # FINAL network paths (Where they go when finished)
+    final_network_vid = os.path.join(output_dir, video_output_filename)
+    final_network_att_csv = os.path.join(output_dir, f"{file_name_no_ext}_output.csv")
+    final_network_dbg_csv = os.path.join(output_dir, f"{file_name_no_ext}_DEBUG_Tracks.csv")
 
-    print(f"[1/4] Copying video {video_filename} locally for processing...")
-    try:
-        shutil.copy(network_input_path, local_input_path)
-    except Exception as e:
-        print(f"Error copying input video locally: {e}")
-        continue
-
-    video_stream = ThreadedVideoReader(local_input_path, queue_size=128).start()
+    print(f"[1/4] Connecting directly to {video_filename} on the network...")
+    # Reading directly from the network to save time
+    video_stream = ThreadedVideoReader(network_input_path, queue_size=128).start()
     
     frame_width = video_stream.frame_width
     frame_height = video_stream.frame_height
@@ -183,7 +179,7 @@ for video_filename in video_files:
     total_frames = video_stream.total_frames
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(temp_local_path, fourcc, fps, (frame_width, frame_height))
+    out = cv2.VideoWriter(temp_local_vid, fourcc, fps, (frame_width, frame_height))
 
     track_visibility = {}  
     track_identities = {}  
@@ -223,7 +219,7 @@ for video_filename in video_files:
                     
                 detections = []
                 for box, prob in zip(boxes, confs):
-                    if prob > 0.60: 
+                    if prob > 0.70: # Raised to 0.70 to prevent hallucination lag
                         x1, y1, x2, y2 = map(int, box)
                         w, h = x2 - x1, y2 - y1
                         
@@ -264,9 +260,9 @@ for video_filename in video_files:
                             if face_crop_bgr.size == 0:
                                 continue
                                 
-                            # Blur check
+                            # Blur check - Loosened to prevent "Analyzing..." limbo
                             sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
-                            if sharpness < 50.0:
+                            if sharpness < 15.0:
                                 continue  
                                 
                             try:
@@ -384,7 +380,11 @@ for video_filename in video_files:
         
         final_memory = {**archived_tracks, **active_track_memory}
 
-        print(f"      Generating Attendance and Debug CSVs...")
+        # ==========================================
+        # PHASE 4: SAVING AND TRANSFERRING
+        # ==========================================
+        print(f"      Generating Attendance and Debug CSVs locally...")
+        
         attendance_records = []
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -392,8 +392,6 @@ for video_filename in video_files:
             votes = global_student_votes.get(student, 0)
             status = 'Present' if votes >= REQUIRED_VOTES else 'Absent'
             attendance_records.append({'Name': student, 'Time': current_time, 'Status': status, 'Detection Count': votes})
-
-        pd.DataFrame(attendance_records).to_csv(attendance_csv_path, index=False)
 
         debug_records = []
         for t_id, data in final_memory.items():
@@ -418,29 +416,37 @@ for video_filename in video_files:
                 'Breakdown': dict(overall_counts)
             })
             
-        pd.DataFrame(debug_records).to_csv(debug_csv_path, index=False)
+        # WRITE EVERYTHING LOCALLY FIRST
+        pd.DataFrame(attendance_records).to_csv(temp_local_att_csv, index=False)
+        pd.DataFrame(debug_records).to_csv(temp_local_dbg_csv, index=False)
 
-        if os.path.exists(temp_local_path):
-            print(f"      Moving processed video to output folder...")
-            os.makedirs(os.path.dirname(final_network_path), exist_ok=True)
-            try:
-                # --- CHANGED: Using shutil.move instead of copyfile for efficiency ---
-                shutil.move(temp_local_path, final_network_path) 
-            except Exception as e:
-                rescue_path = os.path.join(os.path.expanduser('~'), f"RESCUED_{video_output_filename}")
+        # MOVE EVERYTHING TO THE NETWORK USING NATIVE OS COMMANDS
+        print(f"      Moving all processed files to network folder...")
+        os.makedirs(os.path.dirname(final_network_vid), exist_ok=True)
+        
+        files_to_move = [
+            (temp_local_vid, final_network_vid),
+            (temp_local_att_csv, final_network_att_csv),
+            (temp_local_dbg_csv, final_network_dbg_csv)
+        ]
+        
+        for local_src, net_dest in files_to_move:
+            if os.path.exists(local_src):
                 try:
-                    shutil.copyfile(temp_local_path, rescue_path)
-                except Exception:
-                    pass
+                    subprocess.run(['mv', local_src, net_dest], check=True)
+                except subprocess.CalledProcessError:
+                    print(f"      [!] Native move failed for {local_src}. Rescuing to local home drive...")
+                    rescue_path = os.path.join(os.path.expanduser('~'), f"RESCUED_{os.path.basename(local_src)}")
+                    try:
+                        subprocess.run(['mv', local_src, rescue_path], check=True)
+                    except Exception:
+                        pass
 
         print(f"[4/4] Cleaning up local temporary files and resetting memory...")
         try:
-            if os.path.exists(local_input_path):
-                os.remove(local_input_path)
-            # Remove temp_local_path check here is optional since move() deletes it automatically, 
-            # but safe to keep in case of error.
-            if os.path.exists(temp_local_path):
-                os.remove(temp_local_path)
+            for local_src, _ in files_to_move:
+                if os.path.exists(local_src):
+                    os.remove(local_src)
         except Exception:
             pass
             
