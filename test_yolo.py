@@ -222,7 +222,7 @@ for video_filename in video_files:
                     
                 detections = []
                 for box, prob in zip(boxes, confs):
-                    if prob > 0.60: 
+                    if prob > 0.75: 
                         x1, y1, x2, y2 = map(int, box)
                         w, h = x2 - x1, y2 - y1
                         
