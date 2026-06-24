@@ -418,17 +418,16 @@ for video_filename in video_files:
                 frame_count += 1
                 pbar.update(1) 
 
-                # --- NEW: Print Profiling Stats Every 150 Frames ---
-                if frame_count % 150 == 0:
+                if frame_count % 1800 == 0:
                     tqdm.write(
-                        f"\n[DEBUG Profiler - Last 150 Frames] "
+                        f"\n[DEBUG Profiler - Last 1800 Frames] "
                         f"YOLO: {profiler['yolo']:.2f}s | "
                         f"DeepSORT: {profiler['deepsort']:.2f}s | "
                         f"Align: {profiler['alignment']:.2f}s | "
                         f"FaceNet: {profiler['facenet']:.2f}s | "
                         f"FAISS: {profiler['faiss']:.2f}s"
                     )
-                    # Reset profiler for the next block
+                    # Reset profiler for the next block   
                     for k in profiler:
                         profiler[k] = 0.0
 
