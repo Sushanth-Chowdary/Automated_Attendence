@@ -159,15 +159,16 @@ for video_filename in video_files:
     network_input_path = os.path.join(input_dir, video_filename)
     file_name_no_ext, _ = os.path.splitext(video_filename)
     
-    local_input_path = f"/tmp/input_{video_filename}"
+    # --- CHANGED: Writing entirely to the local working directory ---
+    local_input_path = f"./input_{video_filename}"
     video_output_filename = f"{file_name_no_ext}_output.mp4"
-    temp_local_path = f"/tmp/temp_{video_output_filename}" 
+    temp_local_path = f"./temp_{video_output_filename}" 
     
     final_network_path = os.path.join(output_dir, video_output_filename)
     attendance_csv_path = os.path.join(output_dir, f"{file_name_no_ext}_output.csv")
     debug_csv_path = os.path.join(output_dir, f"{file_name_no_ext}_DEBUG_Tracks.csv")
 
-    print(f"[1/4] Sending video {video_filename} to /tmp/ for local processing...")
+    print(f"[1/4] Copying video {video_filename} locally for processing...")
     try:
         shutil.copy(network_input_path, local_input_path)
     except Exception as e:
@@ -196,7 +197,7 @@ for video_filename in video_files:
     profiler = {
         'yolo': 0.0,
         'deepsort': 0.0,
-        'cropping': 0.0, # Renamed from 'alignment'
+        'cropping': 0.0, 
         'facenet': 0.0,
         'faiss': 0.0,
         'drawing': 0.0
@@ -222,7 +223,7 @@ for video_filename in video_files:
                     
                 detections = []
                 for box, prob in zip(boxes, confs):
-                    if prob > 0.75: 
+                    if prob > 0.60: 
                         x1, y1, x2, y2 = map(int, box)
                         w, h = x2 - x1, y2 - y1
                         
@@ -396,7 +397,6 @@ for video_filename in video_files:
 
         debug_records = []
         for t_id, data in final_memory.items():
-            # CSV DEBUG FIX: explicitly catch people dropped by the sharpness filter
             if len(data['all_preds']) == 0:
                 debug_records.append({
                     'Track ID': t_id,
@@ -421,10 +421,11 @@ for video_filename in video_files:
         pd.DataFrame(debug_records).to_csv(debug_csv_path, index=False)
 
         if os.path.exists(temp_local_path):
-            print(f"      Copying processed video back to output folder...")
+            print(f"      Moving processed video to output folder...")
             os.makedirs(os.path.dirname(final_network_path), exist_ok=True)
             try:
-                shutil.copyfile(temp_local_path, final_network_path) 
+                # --- CHANGED: Using shutil.move instead of copyfile for efficiency ---
+                shutil.move(temp_local_path, final_network_path) 
             except Exception as e:
                 rescue_path = os.path.join(os.path.expanduser('~'), f"RESCUED_{video_output_filename}")
                 try:
@@ -432,10 +433,12 @@ for video_filename in video_files:
                 except Exception:
                     pass
 
-        print(f"[4/4] Cleaning up temporary /tmp/ files and resetting memory...")
+        print(f"[4/4] Cleaning up local temporary files and resetting memory...")
         try:
             if os.path.exists(local_input_path):
                 os.remove(local_input_path)
+            # Remove temp_local_path check here is optional since move() deletes it automatically, 
+            # but safe to keep in case of error.
             if os.path.exists(temp_local_path):
                 os.remove(temp_local_path)
         except Exception:
