@@ -17,7 +17,7 @@ import faiss
 import threading
 import queue
 import gc
-import time # <-- NEW: Imported for profiling
+import time 
 
 # Tracker Import
 from deep_sort_realtime.deepsort_tracker import DeepSort
@@ -77,9 +77,10 @@ class ThreadedVideoReader:
 
 
 # ==========================================
-# ALIGNMENT HELPER FUNCTIONS
+# CROP HELPER FUNCTION (Alignment Removed)
 # ==========================================
 def crop_standard(img, box):
+    """Grabs the raw face with a 15% margin for context."""
     x1, y1, x2, y2 = map(int, box)
     w, h = x2 - x1, y2 - y1
     margin_x, margin_y = int(w * 0.15), int(h * 0.15)
@@ -91,66 +92,12 @@ def crop_standard(img, box):
     
     return img[y1:y2, x1:x2]
 
-def align_face(img, box, keypoints):
-    if keypoints is None or len(keypoints) < 2:
-        return crop_standard(img, box)
-        
-    x1, y1, x2, y2 = map(int, box)
-    left_eye, right_eye = keypoints[0], keypoints[1]
-    
-    if left_eye[0] > right_eye[0]:
-        left_eye, right_eye = right_eye, left_eye
-        
-    dx = right_eye[0] - left_eye[0]
-    dy = right_eye[1] - left_eye[1]
-    
-    if dx == 0:
-        return crop_standard(img, box)
-        
-    angle = np.degrees(np.arctan2(dy, dx))
-    
-    w, h = x2 - x1, y2 - y1
-    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    
-    margin_x, margin_y = int(w * 0.5), int(h * 0.5)
-    X1 = max(0, cx - w - margin_x)
-    Y1 = max(0, cy - h - margin_y)
-    X2 = min(img.shape[1], cx + w + margin_x)
-    Y2 = min(img.shape[0], cy + h + margin_y)
-    
-    large_crop = img[Y1:Y2, X1:X2]
-    if large_crop.size == 0:
-        return crop_standard(img, box)
-        
-    eye_center = ((left_eye[0] + right_eye[0]) / 2 - X1, (left_eye[1] + right_eye[1]) / 2 - Y1)
-    
-    M = cv2.getRotationMatrix2D(eye_center, angle, 1.0)
-    rotated_crop = cv2.warpAffine(large_crop, M, (large_crop.shape[1], large_crop.shape[0]), flags=cv2.INTER_CUBIC)
-    
-    local_cx, local_cy = cx - X1, cy - Y1
-    new_cx = M[0, 0] * local_cx + M[0, 1] * local_cy + M[0, 2]
-    new_cy = M[1, 0] * local_cx + M[1, 1] * local_cy + M[1, 2]
-    
-    fin_margin_x, fin_margin_y = int(w * 0.15), int(h * 0.15)
-    fx1 = int(new_cx - w/2 - fin_margin_x)
-    fy1 = int(new_cy - h/2 - fin_margin_y)
-    fx2 = int(new_cx + w/2 + fin_margin_x)
-    fy2 = int(new_cy + h/2 + fin_margin_y)
-    
-    fx1, fy1 = max(0, fx1), max(0, fy1)
-    fx2, fy2 = min(rotated_crop.shape[1], fx2), min(rotated_crop.shape[0], fy2)
-    
-    final_crop = rotated_crop[fy1:fy2, fx1:fx2]
-    if final_crop.size == 0:
-        return crop_standard(img, box)
-        
-    return final_crop
-
 
 # 2. Setup Devices and Models
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Running on device: {device}")
 
+# We no longer need keypoints, making YOLO run slightly faster!
 yolo_model = YOLO('yolov8n-face.pt', task='detect')
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device).half()
 
@@ -246,11 +193,10 @@ for video_filename in video_files:
     
     frame_count = 0
     
-    # --- NEW: Profiling Dictionary ---
     profiler = {
         'yolo': 0.0,
         'deepsort': 0.0,
-        'alignment': 0.0,
+        'cropping': 0.0, # Renamed from 'alignment'
         'facenet': 0.0,
         'faiss': 0.0,
         'drawing': 0.0
@@ -272,7 +218,6 @@ for video_filename in video_files:
                 results = yolo_model(frame, verbose=False)
                 boxes = results[0].boxes.xyxy.cpu().numpy()
                 confs = results[0].boxes.conf.cpu().numpy()
-                raw_kpts = results[0].keypoints.xy.cpu().numpy() if hasattr(results[0], 'keypoints') and results[0].keypoints is not None else None
                 profiler['yolo'] += (time.time() - t_start)
                     
                 detections = []
@@ -280,7 +225,9 @@ for video_filename in video_files:
                     if prob > 0.60: 
                         x1, y1, x2, y2 = map(int, box)
                         w, h = x2 - x1, y2 - y1
-                        detections.append(([x1, y1, w, h], prob, 'face'))
+                        
+                        if w >= 50 and h >= 50: 
+                            detections.append(([x1, y1, w, h], prob, 'face'))
 
                 t_start = time.time()
                 tracks = tracker.update_tracks(detections, frame=frame)
@@ -311,25 +258,17 @@ for video_filename in video_files:
                             if (x2 - x1) < 50 or (y2 - y1) < 50: 
                                 continue
 
-                            best_kpt = None
-                            if raw_kpts is not None and len(boxes) > 0:
-                                txc, tyc = (x1 + x2) / 2, (y1 + y2) / 2
-                                min_dist = float('inf')
-                                for i, rbox in enumerate(boxes):
-                                    rxc, ryc = (rbox[0] + rbox[2]) / 2, (rbox[1] + rbox[3]) / 2
-                                    dist = (txc - rxc)**2 + (tyc - ryc)**2
-                                    if dist < min_dist:
-                                        min_dist = dist
-                                        best_kpt = raw_kpts[i]
-                                if min_dist > 2500: 
-                                    best_kpt = None
-
+                            # Grab raw face crop
+                            face_crop_bgr = crop_standard(frame, track_box)
+                            if face_crop_bgr.size == 0:
+                                continue
+                                
+                            # Blur check
+                            sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
+                            if sharpness < 50.0:
+                                continue  
+                                
                             try:
-                                face_crop_bgr = align_face(frame, track_box, best_kpt)
-                                sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
-                                if sharpness < 50.0:
-                                    continue  
-                                    
                                 face_crop_rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
                                 face_crop_pil = Image.fromarray(face_crop_rgb)
                                 
@@ -342,7 +281,7 @@ for video_filename in video_files:
                                 pass 
                         else:
                             track_visibility[t_id] = False
-                    profiler['alignment'] += (time.time() - t_start)
+                    profiler['cropping'] += (time.time() - t_start)
 
                     if len(batch_tensors) > 0:
                         t_start = time.time()
@@ -423,11 +362,10 @@ for video_filename in video_files:
                         f"\n[DEBUG Profiler - Last 5400 Frames] "
                         f"YOLO: {profiler['yolo']:.2f}s | "
                         f"DeepSORT: {profiler['deepsort']:.2f}s | "
-                        f"Align: {profiler['alignment']:.2f}s | "
+                        f"Crop: {profiler['cropping']:.2f}s | "
                         f"FaceNet: {profiler['facenet']:.2f}s | "
                         f"FAISS: {profiler['faiss']:.2f}s"
                     )
-                    # Reset profiler for the next block   
                     for k in profiler:
                         profiler[k] = 0.0
 
@@ -458,7 +396,15 @@ for video_filename in video_files:
 
         debug_records = []
         for t_id, data in final_memory.items():
+            # CSV DEBUG FIX: explicitly catch people dropped by the sharpness filter
             if len(data['all_preds']) == 0:
+                debug_records.append({
+                    'Track ID': t_id,
+                    'First Seen': data['start_time'],
+                    'Total Frames': 0,
+                    'Predicted Identity': "Rejected (Blurry)",
+                    'Breakdown': {}
+                })
                 continue
                 
             overall_counts = Counter(data['all_preds'])
