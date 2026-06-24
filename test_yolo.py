@@ -418,9 +418,9 @@ for video_filename in video_files:
                 frame_count += 1
                 pbar.update(1) 
 
-                if frame_count % 1800 == 0:
+                if frame_count % 5400 == 0:
                     tqdm.write(
-                        f"\n[DEBUG Profiler - Last 1800 Frames] "
+                        f"\n[DEBUG Profiler - Last 5400 Frames] "
                         f"YOLO: {profiler['yolo']:.2f}s | "
                         f"DeepSORT: {profiler['deepsort']:.2f}s | "
                         f"Align: {profiler['alignment']:.2f}s | "
