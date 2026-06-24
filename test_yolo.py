@@ -16,13 +16,14 @@ from collections import Counter
 import faiss
 import threading
 import queue
-import gc # <-- NEW: Needed for memory management
+import gc
+import time # <-- NEW: Imported for profiling
 
 # Tracker Import
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
 # ==========================================
-# THREADED VIDEO I/O HELPER (FIXED FOR DEADLOCKS)
+# THREADED VIDEO I/O HELPER 
 # ==========================================
 class ThreadedVideoReader:
     def __init__(self, path, queue_size=128):
@@ -48,8 +49,6 @@ class ThreadedVideoReader:
                 self.stopped = True
                 break
             
-            # FIXED: Use a timeout so the thread can routinely check if it was 
-            # stopped by the main loop, preventing infinite deadlocks.
             while not self.stopped:
                 try:
                     self.q.put(frame, timeout=0.5)
@@ -60,7 +59,6 @@ class ThreadedVideoReader:
         self.cap.release()
 
     def read(self):
-        # FIXED: Timeout prevents main thread from freezing if stream drops
         try:
             return self.q.get(timeout=2.0)
         except queue.Empty:
@@ -71,7 +69,6 @@ class ThreadedVideoReader:
 
     def stop(self):
         self.stopped = True
-        # FIXED: Flush the queue to immediately unblock the background thread's put()
         while not self.q.empty():
             try:
                 self.q.get_nowait()
@@ -249,6 +246,16 @@ for video_filename in video_files:
     
     frame_count = 0
     
+    # --- NEW: Profiling Dictionary ---
+    profiler = {
+        'yolo': 0.0,
+        'deepsort': 0.0,
+        'alignment': 0.0,
+        'facenet': 0.0,
+        'faiss': 0.0,
+        'drawing': 0.0
+    }
+    
     print(f"[2/4] Processing frames...")
     try:
         with tqdm(total=total_frames, desc="Processing Video", unit="frame") as pbar:
@@ -261,11 +268,12 @@ for video_filename in video_files:
                 is_keyframe = (frame_count % FRAME_SKIP == 0)
 
                 # --- 1. TRACKING PHASE ---
+                t_start = time.time()
                 results = yolo_model(frame, verbose=False)
                 boxes = results[0].boxes.xyxy.cpu().numpy()
                 confs = results[0].boxes.conf.cpu().numpy()
-                
                 raw_kpts = results[0].keypoints.xy.cpu().numpy() if hasattr(results[0], 'keypoints') and results[0].keypoints is not None else None
+                profiler['yolo'] += (time.time() - t_start)
                     
                 detections = []
                 for box, prob in zip(boxes, confs):
@@ -274,13 +282,16 @@ for video_filename in video_files:
                         w, h = x2 - x1, y2 - y1
                         detections.append(([x1, y1, w, h], prob, 'face'))
 
+                t_start = time.time()
                 tracks = tracker.update_tracks(detections, frame=frame)
+                profiler['deepsort'] += (time.time() - t_start)
 
                 # --- 2. LOGIC & VISIBILITY PHASE ---
                 if is_keyframe:
                     batch_tensors = []
                     batch_track_ids = []
 
+                    t_start = time.time()
                     for track in tracks:
                         if not track.is_confirmed():
                             continue
@@ -315,7 +326,6 @@ for video_filename in video_files:
 
                             try:
                                 face_crop_bgr = align_face(frame, track_box, best_kpt)
-                                
                                 sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
                                 if sharpness < 50.0:
                                     continue  
@@ -332,13 +342,16 @@ for video_filename in video_files:
                                 pass 
                         else:
                             track_visibility[t_id] = False
+                    profiler['alignment'] += (time.time() - t_start)
 
                     if len(batch_tensors) > 0:
+                        t_start = time.time()
                         combined_tensors = torch.cat(batch_tensors, dim=0).half() 
-                        
                         with torch.no_grad():
                             embeddings = resnet(combined_tensors).detach().cpu().numpy().astype('float32')
+                        profiler['facenet'] += (time.time() - t_start)
 
+                        t_start = time.time()
                         faiss.normalize_L2(embeddings)
                         distances, indices = index.search(embeddings, k=1)
 
@@ -368,8 +381,10 @@ for video_filename in video_files:
                                 
                                 if t_id not in track_identities or winner != "Unknown":
                                     track_identities[t_id] = winner
+                        profiler['faiss'] += (time.time() - t_start)
 
                 # --- 3. DRAWING PHASE ---
+                t_start = time.time()
                 for track in tracks:
                     if not track.is_confirmed():
                         continue
@@ -386,6 +401,7 @@ for video_filename in video_files:
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 out.write(frame)
+                profiler['drawing'] += (time.time() - t_start)
                 
                 # --- GARBAGE COLLECTION ---
                 alive_ids = set(t.track_id for t in tracks if t.is_confirmed())
@@ -401,6 +417,20 @@ for video_filename in video_files:
                         
                 frame_count += 1
                 pbar.update(1) 
+
+                # --- NEW: Print Profiling Stats Every 150 Frames ---
+                if frame_count % 150 == 0:
+                    tqdm.write(
+                        f"\n[DEBUG Profiler - Last 150 Frames] "
+                        f"YOLO: {profiler['yolo']:.2f}s | "
+                        f"DeepSORT: {profiler['deepsort']:.2f}s | "
+                        f"Align: {profiler['alignment']:.2f}s | "
+                        f"FaceNet: {profiler['facenet']:.2f}s | "
+                        f"FAISS: {profiler['faiss']:.2f}s"
+                    )
+                    # Reset profiler for the next block
+                    for k in profiler:
+                        profiler[k] = 0.0
 
     except Exception as e:
         print(f"\n[!] Error encountered during frame processing: {e}")
@@ -466,7 +496,6 @@ for video_filename in video_files:
         except Exception:
             pass
             
-        # --- NEW: Explicit Memory Annihilation ---
         if 'tracker' in locals():
             del tracker
         if 'video_stream' in locals():
