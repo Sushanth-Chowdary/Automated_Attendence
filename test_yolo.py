@@ -158,7 +158,9 @@ for video_filename in video_files:
 
     network_input_path = os.path.join(input_dir, video_filename)
     file_name_no_ext, _ = os.path.splitext(video_filename)
-    
+
+    video_output_filename = f"{file_name_no_ext}_output.mp4"
+
     # LOCAL temporary paths (Writing directly to your Ubuntu machine)
     temp_local_vid = f"./temp_{video_output_filename}" 
     temp_local_att_csv = f"./temp_{file_name_no_ext}_output.csv"
@@ -219,7 +221,7 @@ for video_filename in video_files:
                     
                 detections = []
                 for box, prob in zip(boxes, confs):
-                    if prob > 0.80: # Raised to 0.70 to prevent hallucination lag
+                    if prob > 0.70: # Raised to 0.70 to prevent hallucination lag
                         x1, y1, x2, y2 = map(int, box)
                         w, h = x2 - x1, y2 - y1
                         
