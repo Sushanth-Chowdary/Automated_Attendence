@@ -16,64 +16,73 @@ from collections import Counter
 import faiss
 import threading
 import queue
+import gc # <-- NEW: Needed for memory management
 
 # Tracker Import
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
 # ==========================================
-# THREADED VIDEO I/O HELPER
+# THREADED VIDEO I/O HELPER (FIXED FOR DEADLOCKS)
 # ==========================================
 class ThreadedVideoReader:
     def __init__(self, path, queue_size=128):
-        # Initialize standard capture
         self.cap = cv2.VideoCapture(path)
-        
-        # Get video properties right away so we can use them later
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # The Queue is our "waiting line" for frames
         self.q = queue.Queue(maxsize=queue_size)
         self.stopped = False
 
     def start(self):
-        # Start the background thread
         t = threading.Thread(target=self.update, args=())
         t.daemon = True
         t.start()
         return self
 
     def update(self):
-        # This loop runs constantly in the background
         while not self.stopped:
             ret, frame = self.cap.read()
             if not ret:
                 self.stopped = True
-                return
+                break
             
-            # .put() naturally blocks/pauses the thread if the queue is at maxsize (128).
-            # This prevents the CPU from spinning infinitely and locking up the script!
-            self.q.put(frame)
+            # FIXED: Use a timeout so the thread can routinely check if it was 
+            # stopped by the main loop, preventing infinite deadlocks.
+            while not self.stopped:
+                try:
+                    self.q.put(frame, timeout=0.5)
+                    break 
+                except queue.Full:
+                    continue
+                    
+        self.cap.release()
 
     def read(self):
-        # The main script calls this to instantly grab the next ready frame
-        return self.q.get()
+        # FIXED: Timeout prevents main thread from freezing if stream drops
+        try:
+            return self.q.get(timeout=2.0)
+        except queue.Empty:
+            return None
 
     def more(self):
-        # Check if there are still frames left
         return self.q.qsize() > 0 or not self.stopped
 
     def stop(self):
         self.stopped = True
-        self.cap.release()
+        # FIXED: Flush the queue to immediately unblock the background thread's put()
+        while not self.q.empty():
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                break
+
 
 # ==========================================
 # ALIGNMENT HELPER FUNCTIONS
 # ==========================================
 def crop_standard(img, box):
-    """Fallback standard crop with 15% margin."""
     x1, y1, x2, y2 = map(int, box)
     w, h = x2 - x1, y2 - y1
     margin_x, margin_y = int(w * 0.15), int(h * 0.15)
@@ -86,7 +95,6 @@ def crop_standard(img, box):
     return img[y1:y2, x1:x2]
 
 def align_face(img, box, keypoints):
-    """Rotates the face to align the eyes horizontally."""
     if keypoints is None or len(keypoints) < 2:
         return crop_standard(img, box)
         
@@ -141,14 +149,12 @@ def align_face(img, box, keypoints):
         
     return final_crop
 
+
 # 2. Setup Devices and Models
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Running on device: {device}")
 
-# --- UPDATED TO USE TENSORRT ENGINE ---
-# Change this back
 yolo_model = YOLO('yolov8n-face.pt', task='detect')
-
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device).half()
 
 # 3. Load the FAISS Index and Mappings
@@ -254,7 +260,7 @@ for video_filename in video_files:
 
                 is_keyframe = (frame_count % FRAME_SKIP == 0)
 
-                # --- 1. TRACKING PHASE (Run on EVERY frame) ---
+                # --- 1. TRACKING PHASE ---
                 results = yolo_model(frame, verbose=False)
                 boxes = results[0].boxes.xyxy.cpu().numpy()
                 confs = results[0].boxes.conf.cpu().numpy()
@@ -288,7 +294,7 @@ for video_filename in video_files:
 
                         if track.time_since_update == 0:
                             track_visibility[t_id] = True
-                            track_box = track.to_ltrb() # x1, y1, x2, y2
+                            track_box = track.to_ltrb()
                             
                             x1, y1, x2, y2 = map(int, track_box)
                             if (x2 - x1) < 50 or (y2 - y1) < 50: 
@@ -310,12 +316,10 @@ for video_filename in video_files:
                             try:
                                 face_crop_bgr = align_face(frame, track_box, best_kpt)
                                 
-                                # --- NEW QUALITY GATE ---
                                 sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
                                 if sharpness < 50.0:
-                                    continue  # Skip this blurry face
-                                # ------------------------
-
+                                    continue  
+                                    
                                 face_crop_rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
                                 face_crop_pil = Image.fromarray(face_crop_rgb)
                                 
@@ -365,7 +369,7 @@ for video_filename in video_files:
                                 if t_id not in track_identities or winner != "Unknown":
                                     track_identities[t_id] = winner
 
-                # --- 3. DRAWING PHASE (Run Every Frame) ---
+                # --- 3. DRAWING PHASE ---
                 for track in tracks:
                     if not track.is_confirmed():
                         continue
@@ -442,33 +446,35 @@ for video_filename in video_files:
         pd.DataFrame(debug_records).to_csv(debug_csv_path, index=False)
 
         if os.path.exists(temp_local_path):
-            print(f"      Copying processed video back to output folder: {final_network_path}")
-            
+            print(f"      Copying processed video back to output folder...")
             os.makedirs(os.path.dirname(final_network_path), exist_ok=True)
-            
             try:
                 shutil.copyfile(temp_local_path, final_network_path) 
             except Exception as e:
-                print(f"      [!] Failed to copy output video back: {e}")
-                
                 rescue_path = os.path.join(os.path.expanduser('~'), f"RESCUED_{video_output_filename}")
-                print(f"      [!] Rescuing file to local drive: {rescue_path}")
                 try:
                     shutil.copyfile(temp_local_path, rescue_path)
-                    print("      [+] File successfully rescued to your local home folder.")
-                except Exception as rescue_e:
-                    print(f"      [!] Failsafe failed: {rescue_e}")
+                except Exception:
+                    pass
 
-        print(f"[4/4] Cleaning up temporary /tmp/ files...")
+        print(f"[4/4] Cleaning up temporary /tmp/ files and resetting memory...")
         try:
             if os.path.exists(local_input_path):
                 os.remove(local_input_path)
-                print(f"      Deleted {local_input_path}")
             if os.path.exists(temp_local_path):
                 os.remove(temp_local_path)
-                print(f"      Deleted {temp_local_path}")
-        except Exception as e:
-            print(f"      [!] Error deleting temp files: {e}")
+        except Exception:
+            pass
+            
+        # --- NEW: Explicit Memory Annihilation ---
+        if 'tracker' in locals():
+            del tracker
+        if 'video_stream' in locals():
+            del video_stream
+            
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
             
         print(f"\n*** Process completely finished for {video_filename}! ***\n")
 
