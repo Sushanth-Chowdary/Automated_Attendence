@@ -13,7 +13,6 @@ Results/
 *.jpg
 *.bin
 *.pt
-*.pt
 *.onnx
 *.engine
 .vscode
