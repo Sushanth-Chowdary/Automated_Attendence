@@ -15,7 +15,6 @@ import faiss
 # ALIGNMENT HELPER FUNCTIONS
 # ==========================================
 def crop_standard(img, box):
-    """Fallback standard crop with 15% margin."""
     x1, y1, x2, y2 = map(int, box)
     w, h = x2 - x1, y2 - y1
     margin_x, margin_y = int(w * 0.15), int(h * 0.15)
@@ -28,14 +27,12 @@ def crop_standard(img, box):
     return img[y1:y2, x1:x2]
 
 def align_face(img, box, keypoints):
-    """Rotates the face to align the eyes horizontally."""
     if keypoints is None or len(keypoints) < 2:
         return crop_standard(img, box)
         
     x1, y1, x2, y2 = map(int, box)
     left_eye, right_eye = keypoints[0], keypoints[1]
     
-    # Ensure left_eye is physically on the left side of the image
     if left_eye[0] > right_eye[0]:
         left_eye, right_eye = right_eye, left_eye
         
@@ -45,13 +42,11 @@ def align_face(img, box, keypoints):
     if dx == 0:
         return crop_standard(img, box)
         
-    # Calculate angle for affine transformation
     angle = np.degrees(np.arctan2(dy, dx))
     
     w, h = x2 - x1, y2 - y1
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
     
-    # Take a larger 50% margin crop first to prevent losing corners during rotation
     margin_x, margin_y = int(w * 0.5), int(h * 0.5)
     X1 = max(0, cx - w - margin_x)
     Y1 = max(0, cy - h - margin_y)
@@ -62,26 +57,21 @@ def align_face(img, box, keypoints):
     if large_crop.size == 0:
         return crop_standard(img, box)
         
-    # Shift eye center to the local coordinate space of the large crop
     eye_center = ((left_eye[0] + right_eye[0]) / 2 - X1, (left_eye[1] + right_eye[1]) / 2 - Y1)
     
-    # Rotate the large crop
     M = cv2.getRotationMatrix2D(eye_center, angle, 1.0)
     rotated_crop = cv2.warpAffine(large_crop, M, (large_crop.shape[1], large_crop.shape[0]), flags=cv2.INTER_CUBIC)
     
-    # Transform the original box center to the new rotated space
     local_cx, local_cy = cx - X1, cy - Y1
     new_cx = M[0, 0] * local_cx + M[0, 1] * local_cy + M[0, 2]
     new_cy = M[1, 0] * local_cx + M[1, 1] * local_cy + M[1, 2]
     
-    # Apply final 15% margin on the straightened face
     fin_margin_x, fin_margin_y = int(w * 0.15), int(h * 0.15)
     fx1 = int(new_cx - w/2 - fin_margin_x)
     fy1 = int(new_cy - h/2 - fin_margin_y)
     fx2 = int(new_cx + w/2 + fin_margin_x)
     fy2 = int(new_cy + h/2 + fin_margin_y)
     
-    # Boundary checks
     fx1, fy1 = max(0, fx1), max(0, fy1)
     fx2, fy2 = min(rotated_crop.shape[1], fx2), min(rotated_crop.shape[0], fy2)
     
@@ -91,24 +81,25 @@ def align_face(img, box, keypoints):
         
     return final_crop
 
-# 2. Initialize YOLOv8 and FaceNet
+# ==========================================
+# 2. SETUP DEVICES & MODELS
+# ==========================================
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Running on device: {device}")
 
-# Using the optimized TensorRT engine
+# Using your optimized TensorRT engine
 yolo_model = YOLO('yolov8n-face.engine', task='detect') 
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
 dataset_path = './LABELS'
-BATCH_SIZE = 32  # <-- NEW: How many faces to send to the GPU at once
+BATCH_SIZE = 32  
 
 to_tensor = transforms.Compose([
-    transforms.Resize((160, 160)),
     transforms.ToTensor()
 ])
 
 # ==========================================
-# PHASE 1: Smart Extract & Save Embeddings (BATCHED)
+# PHASE 1: Smart Extract & Save Embeddings
 # ==========================================
 print("\n--- PHASE 1: Extracting and Saving Embeddings ---")
 
@@ -140,68 +131,71 @@ for person_name in os.listdir(dataset_path):
         if not needs_processing:
             continue
 
-        valid_face_tensors = []  # <-- NEW: Store tensors here before passing to network
+        valid_face_tensors = []  
         person_embeddings = []
         
         for image_name in image_files:
             image_path = os.path.join(person_dir, image_name)
             try:
-                # Load with OpenCV for easier alignment transformations
                 img_cv2 = cv2.imread(image_path)
                 if img_cv2 is None:
                     continue
                 
-                # YOLOv8 Detection
-                results = yolo_model(img_cv2, verbose=False)
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                keypoints = results[0].keypoints.xy.cpu().numpy() if hasattr(results[0], 'keypoints') and results[0].keypoints is not None else None
+                h, w = img_cv2.shape[:2]
+                
+                # --- SMART BYPASS LOGIC ---
+                if h == 160 and w == 160:
+                    # Assume this is already an MTCNN crop or processed by extract_faces.py
+                    face_crop_160 = img_cv2
+                else:
+                    # Run YOLOv8 Detection for raw, uncropped images
+                    results = yolo_model(img_cv2, verbose=False)
+                    boxes = results[0].boxes.xyxy.cpu().numpy()
+                    keypoints = results[0].keypoints.xy.cpu().numpy() if hasattr(results[0], 'keypoints') and results[0].keypoints is not None else None
 
-                if len(boxes) == 0:
-                    print(f"  -> No face detected in {image_name}, skipping.")
-                    continue
-                
-                areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-                largest_face_idx = np.argmax(areas)
+                    if len(boxes) == 0:
+                        print(f"  -> No face detected in {image_name}, skipping.")
+                        continue
+                    
+                    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+                    largest_face_idx = np.argmax(areas)
 
-                box = boxes[largest_face_idx]
-                kpts = keypoints[largest_face_idx] if keypoints is not None else None
+                    box = boxes[largest_face_idx]
+                    kpts = keypoints[largest_face_idx] if keypoints is not None else None
+                    
+                    # Align and crop
+                    face_crop_bgr = align_face(img_cv2, box, kpts)
+                    
+                    # STRICT RESIZE to 160x160
+                    face_crop_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
                 
-                # Align and crop the face
-                face_crop_bgr = align_face(img_cv2, box, kpts)
-                
-                # Quality Gate
-                sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
-                if sharpness < 50.0:
+                # Quality Gate (Applies to both bypassed and YOLO-cropped images)
+                sharpness = cv2.Laplacian(face_crop_160, cv2.CV_64F).var()
+                if sharpness < 10.0:
                     print(f"  -> Skipping {image_name}: Too blurry (Sharpness: {sharpness:.1f})")
                     continue
                 
-                # Convert back to format FaceNet expects
-                face_crop_rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
+                # Convert to Tensor for FaceNet
+                face_crop_rgb = cv2.cvtColor(face_crop_160, cv2.COLOR_BGR2RGB)
                 face_crop_pil = Image.fromarray(face_crop_rgb)
                 
-                # Format tensor but DO NOT run through network yet
                 face = to_tensor(face_crop_pil).unsqueeze(0)
                 face = (face - 0.5) * 2
                 
-                valid_face_tensors.append(face) # Add to our holding list
+                valid_face_tensors.append(face)
 
             except Exception as e:
                 print(f"  -> Failed on image {image_name}: {e}")
 
-        # --- NEW: BATCH PROCESSING LOGIC ---
+        # Batch Processing
         if valid_face_tensors:
-            # Process the collected tensors in chunks to prevent GPU memory overload
             for i in range(0, len(valid_face_tensors), BATCH_SIZE):
                 batch = valid_face_tensors[i:i + BATCH_SIZE]
-                
-                # Combine the list of single tensors into one big batch tensor and send to GPU
                 batch_tensor = torch.cat(batch, dim=0).to(device)
                 
-                # Pass the whole batch through the network at once
                 with torch.no_grad():
                     batch_embs = resnet(batch_tensor).detach().cpu().numpy()
                 
-                # Add the resulting array of embeddings to our person's list
                 person_embeddings.extend(batch_embs)
 
         if person_embeddings:
@@ -210,7 +204,7 @@ for person_name in os.listdir(dataset_path):
             print(f"Saved {len(person_embeddings)} updated embeddings to {csv_path}")
 
 # ==========================================
-# PHASE 2: Load ALL Data
+# PHASE 2: Load Data
 # ==========================================
 print("\n--- PHASE 2: Loading Data ---")
 
@@ -240,7 +234,7 @@ for person_name in os.listdir(dataset_path):
 print(f"Loaded a total of {len(X_real)} embeddings across {len(target_names)} classes.")
 
 # ==========================================
-# PHASE 3: Build FAISS Index (Dynamic Fallback)
+# PHASE 3: Build FAISS Index
 # ==========================================
 print("\nBuilding FAISS Index...")
 
