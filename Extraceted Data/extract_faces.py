@@ -1,14 +1,13 @@
-import cv2
 import os
-import torch
+import cv2
 import numpy as np
 from ultralytics import YOLO
 
 # ==========================================
-# ALIGNMENT HELPER FUNCTIONS 
+# CROP HELPER FUNCTION (Alignment Removed)
 # ==========================================
 def crop_standard(img, box):
-    """Fallback standard crop with 15% margin."""
+    """Grabs the raw face with a 15% margin for context. Must match train/test scripts."""
     x1, y1, x2, y2 = map(int, box)
     w, h = x2 - x1, y2 - y1
     margin_x, margin_y = int(w * 0.15), int(h * 0.15)
@@ -20,151 +19,83 @@ def crop_standard(img, box):
     
     return img[y1:y2, x1:x2]
 
-def align_face(img, box, keypoints):
-    """Rotates the face to align the eyes horizontally."""
-    if keypoints is None or len(keypoints) < 2:
-        return crop_standard(img, box)
-        
-    x1, y1, x2, y2 = map(int, box)
-    left_eye, right_eye = keypoints[0], keypoints[1]
-    
-    # Ensure left_eye is physically on the left side of the image
-    if left_eye[0] > right_eye[0]:
-        left_eye, right_eye = right_eye, left_eye
-        
-    dx = right_eye[0] - left_eye[0]
-    dy = right_eye[1] - left_eye[1]
-    
-    if dx == 0:
-        return crop_standard(img, box)
-        
-    # Calculate angle for affine transformation
-    angle = np.degrees(np.arctan2(dy, dx))
-    
-    w, h = x2 - x1, y2 - y1
-    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    
-    # Take a larger 50% margin crop first to prevent losing corners during rotation
-    margin_x, margin_y = int(w * 0.5), int(h * 0.5)
-    X1 = max(0, cx - w - margin_x)
-    Y1 = max(0, cy - h - margin_y)
-    X2 = min(img.shape[1], cx + w + margin_x)
-    Y2 = min(img.shape[0], cy + h + margin_y)
-    
-    large_crop = img[Y1:Y2, X1:X2]
-    if large_crop.size == 0:
-        return crop_standard(img, box)
-        
-    # Shift eye center to the local coordinate space of the large crop
-    eye_center = ((left_eye[0] + right_eye[0]) / 2 - X1, (left_eye[1] + right_eye[1]) / 2 - Y1)
-    
-    # Rotate the large crop
-    M = cv2.getRotationMatrix2D(eye_center, angle, 1.0)
-    rotated_crop = cv2.warpAffine(large_crop, M, (large_crop.shape[1], large_crop.shape[0]), flags=cv2.INTER_CUBIC)
-    
-    # Transform the original box center to the new rotated space
-    local_cx, local_cy = cx - X1, cy - Y1
-    new_cx = M[0, 0] * local_cx + M[0, 1] * local_cy + M[0, 2]
-    new_cy = M[1, 0] * local_cx + M[1, 1] * local_cy + M[1, 2]
-    
-    # Apply final 15% margin on the straightened face
-    fin_margin_x, fin_margin_y = int(w * 0.15), int(h * 0.15)
-    fx1 = int(new_cx - w/2 - fin_margin_x)
-    fy1 = int(new_cy - h/2 - fin_margin_y)
-    fx2 = int(new_cx + w/2 + fin_margin_x)
-    fy2 = int(new_cy + h/2 + fin_margin_y)
-    
-    # Boundary checks
-    fx1, fy1 = max(0, fx1), max(0, fy1)
-    fx2, fy2 = min(rotated_crop.shape[1], fx2), min(rotated_crop.shape[0], fy2)
-    
-    final_crop = rotated_crop[fy1:fy2, fx1:fx2]
-    if final_crop.size == 0:
-        return crop_standard(img, box)
-        
-    return final_crop
-
 # ==========================================
-# 1. SETUP
+# EXTRACTION LOGIC
 # ==========================================
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-print(f"Running on device: {device}")
+def extract_faces_for_dataset(raw_images_dir, output_labels_dir):
+    print("Loading YOLO model...")
+    # Use your base model or the TensorRT engine if preferred
+    yolo_model = YOLO('yolov8n-face.pt', task='detect') 
 
-# Load YOLOv8 Face Model
-yolo_model = YOLO('yolov8n-face.pt', task='detect')
+    if not os.path.exists(output_labels_dir):
+        os.makedirs(output_labels_dir)
 
-# Configuration
-videos_dir = './videos'              
-base_output_dir = './extracted_faces' 
-
-os.makedirs(base_output_dir, exist_ok=True)
-
-# ==========================================
-# 2. PROCESSING LOOP
-# ==========================================
-print("Scanning the 'videos' folder...")
-
-if not os.path.exists(videos_dir):
-    print(f"Error: Could not find folder '{videos_dir}'")
-else:
-    for video_filename in os.listdir(videos_dir):
-        if not (video_filename.lower().endswith(('.mkv', '.mp4'))):
+    # Loop through each person's folder in the raw directory
+    for person_name in os.listdir(raw_images_dir):
+        person_raw_dir = os.path.join(raw_images_dir, person_name)
+        
+        if not os.path.isdir(person_raw_dir):
             continue
-
-        video_path = os.path.join(videos_dir, video_filename)
-        
-        # Extract name
-        person_name = video_filename.split('-')[0]
-        
-        person_output_dir = os.path.join(base_output_dir, person_name)
-        os.makedirs(person_output_dir, exist_ok=True)
-
-        print(f"\n--- Processing video for: {person_name} ---")
-
-        cap = cv2.VideoCapture(video_path)
-        frame_count = 0
-        saved_faces = 0
-        frame_skip = 10  
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-                
-            frame_count += 1
             
-            if frame_count % frame_skip == 0:
-                # Run YOLOv8 on the raw BGR frame
-                results = yolo_model(frame, verbose=False)
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                keypoints = results[0].keypoints.xy.cpu().numpy() if hasattr(results[0], 'keypoints') and results[0].keypoints is not None else None
+        person_out_dir = os.path.join(output_labels_dir, person_name)
+        os.makedirs(person_out_dir, exist_ok=True)
+        
+        image_files = [f for f in os.listdir(person_raw_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        
+        if not image_files:
+            continue
+            
+        print(f"\nProcessing {len(image_files)} images for: {person_name}")
+        saved_count = 0
+        
+        for idx, image_name in enumerate(image_files):
+            image_path = os.path.join(person_raw_dir, image_name)
+            img_cv2 = cv2.imread(image_path)
+            
+            if img_cv2 is None:
+                continue
                 
-                if len(boxes) > 0:
-                    # Find the most prominent face (largest area) to avoid capturing people in the background
-                    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-                    largest_face_idx = np.argmax(areas)
+            # Run YOLO Detection
+            results = yolo_model(img_cv2, verbose=False)
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            
+            if len(boxes) == 0:
+                print(f"  -> No face detected in {image_name}, skipping.")
+                continue
+                
+            # Grab the largest face (assumes the target person is the main subject)
+            areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+            largest_face_idx = np.argmax(areas)
+            box = boxes[largest_face_idx]
+            
+            # Crop with standard 15% margin
+            face_crop_bgr = crop_standard(img_cv2, box)
+            
+            # Strict resize to 160x160 to trigger the bypass logic in train_yolo.py later
+            face_crop_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
+            
+            # Quality Check: Skip heavily blurred images
+            sharpness = cv2.Laplacian(face_crop_160, cv2.CV_64F).var()
+            if sharpness < 4.0:
+                print(f"  -> Skipping {image_name}: Too blurry (Sharpness: {sharpness:.1f})")
+                continue
+            
+            # Save the valid 160x160 crop
+            save_name = f"{person_name}_{idx:04d}.jpg"
+            save_path = os.path.join(person_out_dir, save_name)
+            cv2.imwrite(save_path, face_crop_160)
+            saved_count += 1
+            
+        print(f"Successfully saved {saved_count} valid crops for {person_name}.")
 
-                    box = boxes[largest_face_idx]
-                    kpts = keypoints[largest_face_idx] if keypoints is not None else None
-                    
-                    # Align and crop the face
-                    face_crop_bgr = align_face(frame, box, kpts)
-                    
-                    # Ensure the crop isn't empty before proceeding
-                    if face_crop_bgr.size > 0:
-                        # STRICT RESIZE: Exactly 160x160 to match FaceNet expectations
-                        final_face_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
-                        
-                        filename = f"{person_name}_frame_{frame_count}.jpg"
-                        save_path = os.path.join(person_output_dir, filename)
-                        
-                        try:
-                            cv2.imwrite(save_path, final_face_160)
-                            saved_faces += 1
-                        except Exception as e:
-                            print(f"      Error saving frame {frame_count}: {e}")
-
-        cap.release()
-        print(f"Done! Saved {saved_faces} standardized 160x160 faces for {person_name}.")
-
-print("\nAll videos have been processed successfully!")
+if __name__ == "__main__":
+    # Define your paths here
+    # RAW_DIR should contain subfolders of uncropped pictures (e.g., RAW_DIR/Sushanth/pic1.jpg)
+    RAW_DIR = './RAW_DATA' 
+    TARGET_DIR = './LABELS'
+    
+    if os.path.exists(RAW_DIR):
+        extract_faces_for_dataset(RAW_DIR, TARGET_DIR)
+        print("\nAll extractions complete! You can now run train_yolo.py")
+    else:
+        print(f"Error: The raw images directory '{RAW_DIR}' does not exist. Please create it and add your images.")

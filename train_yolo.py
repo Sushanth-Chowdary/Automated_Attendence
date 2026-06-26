@@ -12,9 +12,10 @@ import pickle
 import faiss
 
 # ==========================================
-# ALIGNMENT HELPER FUNCTIONS
+# CROP HELPER FUNCTION (Alignment Removed)
 # ==========================================
 def crop_standard(img, box):
+    """Grabs the raw face with a 15% margin for context, matching test_yolo.py"""
     x1, y1, x2, y2 = map(int, box)
     w, h = x2 - x1, y2 - y1
     margin_x, margin_y = int(w * 0.15), int(h * 0.15)
@@ -26,60 +27,6 @@ def crop_standard(img, box):
     
     return img[y1:y2, x1:x2]
 
-def align_face(img, box, keypoints):
-    if keypoints is None or len(keypoints) < 2:
-        return crop_standard(img, box)
-        
-    x1, y1, x2, y2 = map(int, box)
-    left_eye, right_eye = keypoints[0], keypoints[1]
-    
-    if left_eye[0] > right_eye[0]:
-        left_eye, right_eye = right_eye, left_eye
-        
-    dx = right_eye[0] - left_eye[0]
-    dy = right_eye[1] - left_eye[1]
-    
-    if dx == 0:
-        return crop_standard(img, box)
-        
-    angle = np.degrees(np.arctan2(dy, dx))
-    
-    w, h = x2 - x1, y2 - y1
-    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    
-    margin_x, margin_y = int(w * 0.5), int(h * 0.5)
-    X1 = max(0, cx - w - margin_x)
-    Y1 = max(0, cy - h - margin_y)
-    X2 = min(img.shape[1], cx + w + margin_x)
-    Y2 = min(img.shape[0], cy + h + margin_y)
-    
-    large_crop = img[Y1:Y2, X1:X2]
-    if large_crop.size == 0:
-        return crop_standard(img, box)
-        
-    eye_center = ((left_eye[0] + right_eye[0]) / 2 - X1, (left_eye[1] + right_eye[1]) / 2 - Y1)
-    
-    M = cv2.getRotationMatrix2D(eye_center, angle, 1.0)
-    rotated_crop = cv2.warpAffine(large_crop, M, (large_crop.shape[1], large_crop.shape[0]), flags=cv2.INTER_CUBIC)
-    
-    local_cx, local_cy = cx - X1, cy - Y1
-    new_cx = M[0, 0] * local_cx + M[0, 1] * local_cy + M[0, 2]
-    new_cy = M[1, 0] * local_cx + M[1, 1] * local_cy + M[1, 2]
-    
-    fin_margin_x, fin_margin_y = int(w * 0.15), int(h * 0.15)
-    fx1 = int(new_cx - w/2 - fin_margin_x)
-    fy1 = int(new_cy - h/2 - fin_margin_y)
-    fx2 = int(new_cx + w/2 + fin_margin_x)
-    fy2 = int(new_cy + h/2 + fin_margin_y)
-    
-    fx1, fy1 = max(0, fx1), max(0, fy1)
-    fx2, fy2 = min(rotated_crop.shape[1], fx2), min(rotated_crop.shape[0], fy2)
-    
-    final_crop = rotated_crop[fy1:fy2, fx1:fx2]
-    if final_crop.size == 0:
-        return crop_standard(img, box)
-        
-    return final_crop
 
 # ==========================================
 # 2. SETUP DEVICES & MODELS
@@ -151,7 +98,6 @@ for person_name in os.listdir(dataset_path):
                     # Run YOLOv8 Detection for raw, uncropped images
                     results = yolo_model(img_cv2, verbose=False)
                     boxes = results[0].boxes.xyxy.cpu().numpy()
-                    keypoints = results[0].keypoints.xy.cpu().numpy() if hasattr(results[0], 'keypoints') and results[0].keypoints is not None else None
 
                     if len(boxes) == 0:
                         print(f"  -> No face detected in {image_name}, skipping.")
@@ -161,10 +107,9 @@ for person_name in os.listdir(dataset_path):
                     largest_face_idx = np.argmax(areas)
 
                     box = boxes[largest_face_idx]
-                    kpts = keypoints[largest_face_idx] if keypoints is not None else None
                     
-                    # Align and crop
-                    face_crop_bgr = align_face(img_cv2, box, kpts)
+                    # Standard unaligned crop matching test_yolo.py
+                    face_crop_bgr = crop_standard(img_cv2, box)
                     
                     # STRICT RESIZE to 160x160
                     face_crop_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
