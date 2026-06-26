@@ -311,13 +311,20 @@ for video_filename in video_files:
                             active_track_memory[t_id]['buffer'].append(predicted_name)
                             active_track_memory[t_id]['all_preds'].append(predicted_name)
 
-                            # --- VOTING FIX INJECTION ---
+                            # --- TRUE CONSENSUS VOTING FIX ---
                             if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
                                 valid_votes = [v for v in active_track_memory[t_id]['buffer'] if v != "Unknown"]
                                 
                                 if valid_votes:
                                     vote_counts = Counter(valid_votes)
-                                    winner = vote_counts.most_common(1)[0][0]
+                                    # Extract both the winner's name AND their vote count
+                                    top_candidate, top_count = vote_counts.most_common(1)[0]
+                                    
+                                    # Demand that the specific candidate got at least 2 consistent votes
+                                    if top_count >= 2:
+                                        winner = top_candidate
+                                    else:
+                                        winner = "Unknown"
                                 else:
                                     winner = "Unknown"
                                     
