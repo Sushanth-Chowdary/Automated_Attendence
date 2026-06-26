@@ -171,7 +171,7 @@ for person_name in os.listdir(dataset_path):
                 
                 # Quality Gate (Applies to both bypassed and YOLO-cropped images)
                 sharpness = cv2.Laplacian(face_crop_160, cv2.CV_64F).var()
-                if sharpness < 10.0:
+                if sharpness < 4.0:
                     print(f"  -> Skipping {image_name}: Too blurry (Sharpness: {sharpness:.1f})")
                     continue
                 

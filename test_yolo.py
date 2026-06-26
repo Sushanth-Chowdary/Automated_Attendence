@@ -264,7 +264,7 @@ for video_filename in video_files:
                                 
                             # Blur check - Loosened to prevent "Analyzing..." limbo
                             sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
-                            if sharpness < 10.0:
+                            if sharpness < 4.0:
                                 continue  
                                 
                             try:
