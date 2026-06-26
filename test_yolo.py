@@ -113,7 +113,7 @@ target_names = saved_data['target_names']
 y_real = saved_data['y_real']
 
 # 4. Define Parameters
-CONFIDENCE_THRESHOLD = 0.80  # Lowered to accommodate unaligned faces
+CONFIDENCE_THRESHOLD = 0.70  # Lowered to accommodate unaligned faces
 FRAME_SKIP = 2                
 FRAMES_PER_VOTE = 8          
 REQUIRED_VOTES = 20           
@@ -154,7 +154,8 @@ for video_filename in video_files:
     print(f"Starting processing for: {video_filename}")
     print(f"{'='*50}")
     
-    tracker = DeepSort(max_age=10, n_init=3, embedder_gpu=True, half=True)
+    # --- TRACKER UPDATED: SORT Hack Applied ---
+    tracker = DeepSort(max_age=30, n_init=3, embedder=None, max_cosine_distance=1.0)
 
     network_input_path = os.path.join(input_dir, video_filename)
     file_name_no_ext, _ = os.path.splitext(video_filename)
@@ -221,7 +222,7 @@ for video_filename in video_files:
                     
                 detections = []
                 for box, prob in zip(boxes, confs):
-                    if prob > 0.70: # Raised to 0.70 to prevent hallucination lag
+                    if prob > 0.70: 
                         x1, y1, x2, y2 = map(int, box)
                         w, h = x2 - x1, y2 - y1
                         
@@ -229,7 +230,9 @@ for video_filename in video_files:
                             detections.append(([x1, y1, w, h], prob, 'face'))
 
                 t_start = time.time()
-                tracks = tracker.update_tracks(detections, frame=frame)
+                # --- SORT HACK INJECTION ---
+                dummy_embeds = [np.ones(512) for _ in range(len(detections))]
+                tracks = tracker.update_tracks(detections, embeds=dummy_embeds)
                 profiler['deepsort'] += (time.time() - t_start)
 
                 # --- 2. LOGIC & VISIBILITY PHASE ---
@@ -308,10 +311,16 @@ for video_filename in video_files:
                             active_track_memory[t_id]['buffer'].append(predicted_name)
                             active_track_memory[t_id]['all_preds'].append(predicted_name)
 
+                            # --- VOTING FIX INJECTION ---
                             if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
-                                vote_counts = Counter(active_track_memory[t_id]['buffer'])
-                                winner = vote_counts.most_common(1)[0][0]
+                                valid_votes = [v for v in active_track_memory[t_id]['buffer'] if v != "Unknown"]
                                 
+                                if valid_votes:
+                                    vote_counts = Counter(valid_votes)
+                                    winner = vote_counts.most_common(1)[0][0]
+                                else:
+                                    winner = "Unknown"
+                                    
                                 if winner != "Unknown":
                                     global_student_votes[winner] += 1
                                     
