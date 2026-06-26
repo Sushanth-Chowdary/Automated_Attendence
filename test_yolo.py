@@ -114,9 +114,9 @@ y_real = saved_data['y_real']
 
 # 4. Define Parameters
 CONFIDENCE_THRESHOLD = 0.70  # Lowered to accommodate unaligned faces
-FRAME_SKIP = 2                
-FRAMES_PER_VOTE = 8          
-REQUIRED_VOTES = 20           
+FRAME_SKIP = 1                
+FRAMES_PER_VOTE = 10          
+REQUIRED_VOTES = 30           
 
 input_dir = 'VIDEOS'
 output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
@@ -321,7 +321,7 @@ for video_filename in video_files:
                                     top_candidate, top_count = vote_counts.most_common(1)[0]
                                     
                                     # Demand that the specific candidate got at least 2 consistent votes
-                                    if top_count >= 2:
+                                    if top_count >= 4:
                                         winner = top_candidate
                                     else:
                                         winner = "Unknown"
