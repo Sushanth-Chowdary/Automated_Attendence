@@ -256,7 +256,7 @@ for video_filename in video_files:
                                 continue
                                 
                             sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
-                            if sharpness < 4.0:
+                            if sharpness < 6.0:
                                 continue  
                                 
                             try:
