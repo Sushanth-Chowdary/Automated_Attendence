@@ -89,7 +89,7 @@ with open('./face_attendance_meta.pkl', 'rb') as f:
 target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
 # 3. Parameters
-CONFIDENCE_THRESHOLD = 0.74     
+CONFIDENCE_THRESHOLD = 0.72     
 FRAME_SKIP = 5                # INCREASED for massive speed boost
 FRAMES_PER_VOTE = 10          
 
@@ -103,7 +103,7 @@ to_tensor = transforms.Compose([transforms.Resize((160, 160)), transforms.ToTens
 target_videos = ['2026-04-27_10.02.44.mkv', '2026-02-25_11.23.07.mkv', '2026-03-05_11.02.28.mkv', '2026-03-09_10.03.16.mkv', '2026-04-07_09.18.02.mkv', 'video2.mkv', '2026-02-25_11.21.17.mkv', '2026-03-09_10.04.35.mkv', '2026-02-25_11.03.43.mkv', '2026-02-18_11.02.03.mkv', 'video1_uajX8qg0.mp4', '2026-02-25_11.00.04.mkv', '2026-02-25_11.15.41.mkv', '2026-03-02_09.55.37.mkv']
 
 
-def save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names):
+def save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir):
     """Phase 4: collapse all tracked identities into a Present/Absent report.
 
     Pulled into its own function so it can be called BOTH on a normal finish
@@ -127,10 +127,14 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
                             'Gate Status': status, 'Breakdown': dict(counts)})
 
     stem = os.path.splitext(video_filename)[0]
-    pd.DataFrame(debug_data).to_csv(f"./temp_{stem}_DEBUG_Tracks.csv")
+    # These now land in ATTENDANCE RESULTS/MINE (output_dir), named after the
+    # source video itself (e.g. "2026-03-09_10.03.16_DEBUG_Tracks.csv"), instead
+    # of whatever folder you happened to launch the script from with a "temp_"
+    # prefix — previously output_dir was created (line ~98) but never used.
+    pd.DataFrame(debug_data).to_csv(os.path.join(output_dir, f"{stem}_DEBUG_Tracks.csv"))
     pd.DataFrame([{'Name': s, 'Status': 'Present' if student_presence[s] else 'Absent'}
-                  for s in target_names]).to_csv(f"./temp_{stem}_output.csv")
-    print(f"  -> Saved attendance + debug CSVs for {video_filename} ({len(final_mem)} tracks)")
+                  for s in target_names]).to_csv(os.path.join(output_dir, f"{stem}_output.csv"))
+    print(f"  -> Saved attendance + debug CSVs for {video_filename} ({len(final_mem)} tracks) to {output_dir}")
 
 
 interrupted = False
@@ -141,7 +145,8 @@ for video_filename in target_videos:
     print(f"\nProcessing: {video_filename}")
     video_stream = ThreadedVideoReader(os.path.join(input_dir, video_filename)).start()
 
-    out = cv2.VideoWriter(f"./temp_{video_filename}", cv2.VideoWriter_fourcc(*'mp4v'), video_stream.fps, (video_stream.frame_width, video_stream.frame_height))
+    video_stem = os.path.splitext(video_filename)[0]
+    out = cv2.VideoWriter(os.path.join(output_dir, f"{video_stem}_output.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), video_stream.fps, (video_stream.frame_width, video_stream.frame_height))
 
     active_track_memory, archived_tracks, track_identities = {}, {}, {}
     frame_count = 0
@@ -230,7 +235,7 @@ for video_filename in target_videos:
         # written via release(), and you always get a CSV instead of nothing.
         video_stream.stop()
         out.release()
-        save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names)
+        save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
 
     if interrupted:
         break
