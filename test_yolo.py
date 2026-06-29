@@ -27,7 +27,10 @@ class ThreadedVideoReader:
         self.cap = cv2.VideoCapture(path)
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+        # Some mkv files (esp. screen-captured / re-muxed ones) report 0 fps from
+        # OpenCV's metadata reader. Guard against that so frame_count // fps below
+        # never throws a ZeroDivisionError.
+        self.fps = int(self.cap.get(cv2.CAP_PROP_FPS)) or 30
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.q = queue.Queue(maxsize=queue_size)
         self.stopped = False
@@ -99,95 +102,140 @@ to_tensor = transforms.Compose([transforms.Resize((160, 160)), transforms.ToTens
 # 4. Processing Loop
 target_videos = ['2026-04-27_10.02.44.mkv', '2026-02-25_11.23.07.mkv', '2026-03-05_11.02.28.mkv', '2026-03-09_10.03.16.mkv', '2026-04-07_09.18.02.mkv', 'video2.mkv', '2026-02-25_11.21.17.mkv', '2026-03-09_10.04.35.mkv', '2026-02-25_11.03.43.mkv', '2026-02-18_11.02.03.mkv', 'video1_uajX8qg0.mp4', '2026-02-25_11.00.04.mkv', '2026-02-25_11.15.41.mkv', '2026-03-02_09.55.37.mkv']
 
-for video_filename in target_videos:
-    if not os.path.exists(os.path.join(input_dir, video_filename)): continue
-    
-    print(f"\nProcessing: {video_filename}")
-    video_stream = ThreadedVideoReader(os.path.join(input_dir, video_filename)).start()
-    
-    out = cv2.VideoWriter(f"./temp_{video_filename}", cv2.VideoWriter_fourcc(*'mp4v'), video_stream.fps, (video_stream.frame_width, video_stream.frame_height))
 
-    active_track_memory, archived_tracks, track_identities = {}, {}, {}
-    frame_count = 0
-    
-    with tqdm(total=video_stream.total_frames, unit="frame") as pbar:
-        while video_stream.more():
-            frame = video_stream.read()
-            if frame is None: break 
+def save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names):
+    """Phase 4: collapse all tracked identities into a Present/Absent report.
 
-            # --- BYTE TRACK ---
-            results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
-            
-            if frame_count % FRAME_SKIP == 0 and results[0].boxes.id is not None:
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                ids = results[0].boxes.id.int().cpu().numpy()
-                
-                batch_tensors, batch_track_ids = [], []
-                
-                for i, t_id in enumerate(ids):
-                    if t_id not in active_track_memory:
-                        active_track_memory[t_id] = {'start_time': f"{frame_count//video_stream.fps}s", 'buffer': [], 'all_preds': []}
-                    
-                    crop = crop_standard(frame, boxes[i])
-                    if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 4.0:
-                        batch_tensors.append((to_tensor(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(device) - 0.5) * 2)
-                        batch_track_ids.append(t_id)
-
-                if batch_tensors:
-                    with torch.no_grad():
-                        embeddings = resnet(torch.cat(batch_tensors, dim=0).half()).cpu().numpy().astype('float32')
-                    faiss.normalize_L2(embeddings)
-                    _, indices = index.search(embeddings, k=1)
-                    
-                    for i, t_id in enumerate(batch_track_ids):
-                        name = target_names[y_real[indices[i][0]]] if _[i][0] > CONFIDENCE_THRESHOLD else "Unknown"
-                        active_track_memory[t_id]['buffer'].append(name)
-                        active_track_memory[t_id]['all_preds'].append(name)
-                        
-                        if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
-                            votes = [v for v in active_track_memory[t_id]['buffer'] if v != "Unknown"]
-                            top_candidate, top_count = Counter(votes).most_common(1)[0] if votes else ("Unknown", 0)
-                            winner = top_candidate if top_count >= 7 else "Unknown"
-                            track_identities[t_id] = winner
-                            active_track_memory[t_id]['buffer'] = []
-
-            # Drawing
-            if results[0].boxes.id is not None:
-                for i, box in enumerate(results[0].boxes.xyxy.cpu().numpy()):
-                    t_id = results[0].boxes.id.int().cpu().numpy()[i]
-                    name = track_identities.get(t_id, "Analyzing...")
-                    color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
-                    cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
-                    cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            
-            out.write(frame)
-            
-            # Memory Cleanup
-            alive_ids = set(results[0].boxes.id.int().cpu().numpy()) if results[0].boxes.id is not None else set()
-            for t_id in list(active_track_memory.keys()):
-                if t_id not in alive_ids:
-                    archived_tracks[t_id] = active_track_memory.pop(t_id)
-            
-            frame_count += 1
-            pbar.update(1)
-
-    # Attendance Logic (Phase 4)
+    Pulled into its own function so it can be called BOTH on a normal finish
+    AND from the interrupt/error handler below — so a Ctrl+C or a crash no
+    longer means losing every track this video has already collected.
+    """
     final_mem = {**archived_tracks, **active_track_memory}
-    debug_data, att_data = [], []
+    debug_data = []
     student_presence = {name: False for name in target_names}
-    
+
     for t_id, data in final_mem.items():
         total = len(data['all_preds'])
         counts = Counter(data['all_preds'])
         winner = counts.most_common(1)[0][0] if data['all_preds'] else "Unknown"
-        
-        status = "Passed" if total >= 90 and (counts.get(winner, 0)/total) >= 0.6 else "Failed"
-        if status == "Passed" and winner != "Unknown": student_presence[winner] = True
-            
-        debug_data.append({'Track ID': t_id, 'Total Frames': total, 'Predicted Identity': winner, 'Gate Status': status, 'Breakdown': dict(counts)})
-        
-    pd.DataFrame(debug_data).to_csv(f"./temp_{os.path.splitext(video_filename)[0]}_DEBUG_Tracks.csv")
-    pd.DataFrame([{'Name': s, 'Status': 'Present' if student_presence[s] else 'Absent'} for s in target_names]).to_csv(f"./temp_{os.path.splitext(video_filename)[0]}_output.csv")
-    
-    video_stream.stop()
-    out.release()
+
+        status = "Passed" if total >= 90 and (counts.get(winner, 0) / total) >= 0.6 else "Failed"
+        if status == "Passed" and winner != "Unknown":
+            student_presence[winner] = True
+
+        debug_data.append({'Track ID': t_id, 'Total Frames': total, 'Predicted Identity': winner,
+                            'Gate Status': status, 'Breakdown': dict(counts)})
+
+    stem = os.path.splitext(video_filename)[0]
+    pd.DataFrame(debug_data).to_csv(f"./temp_{stem}_DEBUG_Tracks.csv")
+    pd.DataFrame([{'Name': s, 'Status': 'Present' if student_presence[s] else 'Absent'}
+                  for s in target_names]).to_csv(f"./temp_{stem}_output.csv")
+    print(f"  -> Saved attendance + debug CSVs for {video_filename} ({len(final_mem)} tracks)")
+
+
+interrupted = False
+
+for video_filename in target_videos:
+    if not os.path.exists(os.path.join(input_dir, video_filename)): continue
+
+    print(f"\nProcessing: {video_filename}")
+    video_stream = ThreadedVideoReader(os.path.join(input_dir, video_filename)).start()
+
+    out = cv2.VideoWriter(f"./temp_{video_filename}", cv2.VideoWriter_fourcc(*'mp4v'), video_stream.fps, (video_stream.frame_width, video_stream.frame_height))
+
+    active_track_memory, archived_tracks, track_identities = {}, {}, {}
+    frame_count = 0
+
+    try:
+        with tqdm(total=video_stream.total_frames, unit="frame") as pbar:
+            while video_stream.more():
+                frame = video_stream.read()
+                if frame is None: break 
+
+                # --- BYTE TRACK ---
+                results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
+
+                # Pull boxes/ids off the GPU ONCE per frame and reuse them for
+                # recognition, drawing, AND cleanup below. Previously the drawing
+                # loop called results[0].boxes.id.int().cpu().numpy() fresh on
+                # EVERY detection (i.e. once per face, not once per frame), which
+                # means re-doing a GPU->CPU sync N times instead of once whenever
+                # N faces were on screen. At any real classroom headcount that adds
+                # up fast and was very likely part of why this felt slow.
+                has_detections = results[0].boxes.id is not None
+                if has_detections:
+                    boxes = results[0].boxes.xyxy.cpu().numpy()
+                    ids = results[0].boxes.id.int().cpu().numpy()
+
+                if frame_count % FRAME_SKIP == 0 and has_detections:
+                    batch_tensors, batch_track_ids = [], []
+
+                    for i, t_id in enumerate(ids):
+                        if t_id not in active_track_memory:
+                            active_track_memory[t_id] = {'start_time': f"{frame_count//video_stream.fps}s", 'buffer': [], 'all_preds': []}
+
+                        crop = crop_standard(frame, boxes[i])
+                        if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 4.0:
+                            batch_tensors.append((to_tensor(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(device) - 0.5) * 2)
+                            batch_track_ids.append(t_id)
+
+                    if batch_tensors:
+                        with torch.no_grad():
+                            embeddings = resnet(torch.cat(batch_tensors, dim=0).half()).cpu().numpy().astype('float32')
+                        faiss.normalize_L2(embeddings)
+                        sims, indices = index.search(embeddings, k=1)
+
+                        for i, t_id in enumerate(batch_track_ids):
+                            name = target_names[y_real[indices[i][0]]] if sims[i][0] > CONFIDENCE_THRESHOLD else "Unknown"
+                            active_track_memory[t_id]['buffer'].append(name)
+                            active_track_memory[t_id]['all_preds'].append(name)
+
+                            if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
+                                votes = [v for v in active_track_memory[t_id]['buffer'] if v != "Unknown"]
+                                top_candidate, top_count = Counter(votes).most_common(1)[0] if votes else ("Unknown", 0)
+                                winner = top_candidate if top_count >= 7 else "Unknown"
+                                track_identities[t_id] = winner
+                                active_track_memory[t_id]['buffer'] = []
+
+                # Drawing
+                if has_detections:
+                    for i in range(len(ids)):
+                        t_id = ids[i]
+                        box = boxes[i]
+                        name = track_identities.get(t_id, "Analyzing...")
+                        color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
+                        cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
+                        cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                out.write(frame)
+
+                # Memory Cleanup
+                alive_ids = set(ids) if has_detections else set()
+                for t_id in list(active_track_memory.keys()):
+                    if t_id not in alive_ids:
+                        archived_tracks[t_id] = active_track_memory.pop(t_id)
+
+                frame_count += 1
+                pbar.update(1)
+
+    except KeyboardInterrupt:
+        # Ctrl+C: stop this video cleanly instead of letting the raw traceback
+        # blow past out.release() / video_stream.stop() and skip the CSV save.
+        print(f"\n[Interrupted] Stopping '{video_filename}' early. "
+              f"Saving whatever attendance data was collected before exiting.")
+        interrupted = True
+    finally:
+        # Runs on a clean finish, a real exception, OR a Ctrl+C — so the reader
+        # thread always gets stopped, the video file always gets a valid footer
+        # written via release(), and you always get a CSV instead of nothing.
+        video_stream.stop()
+        out.release()
+        save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names)
+
+    if interrupted:
+        break
+
+if interrupted:
+    print("\nBatch stopped early by user. Remaining videos in the list were not processed.")
+else:
+    print("\nAll videos processed.")
