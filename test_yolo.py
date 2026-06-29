@@ -27,9 +27,6 @@ class ThreadedVideoReader:
         self.cap = cv2.VideoCapture(path)
         self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        # Some mkv files (esp. screen-captured / re-muxed ones) report 0 fps from
-        # OpenCV's metadata reader. Guard against that so frame_count // fps below
-        # never throws a ZeroDivisionError.
         self.fps = int(self.cap.get(cv2.CAP_PROP_FPS)) or 30
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.q = queue.Queue(maxsize=queue_size)
@@ -76,7 +73,6 @@ def crop_standard(img, box):
     return img[y1:y2, x1:x2]
 
 def format_timestamp(frame_count, fps):
-    """HH:MM:SS position in the video, used to record when a track ID first appeared."""
     total_seconds = frame_count // fps
     h, rem = divmod(total_seconds, 3600)
     m, s = divmod(rem, 60)
@@ -84,7 +80,6 @@ def format_timestamp(frame_count, fps):
 
 # 2. Setup
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-yolo_model = YOLO('yolov8n-face.pt', task='detect')
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device).half()
 
 faiss_index_path = './face_attendance_faiss.bin'
@@ -97,19 +92,12 @@ target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
 # 3. Parameters
 CONFIDENCE_THRESHOLD = 0.74     
-FRAME_SKIP = 5                # INCREASED for massive speed boost
+FRAME_SKIP = 5                
 FRAMES_PER_VOTE = 5          
 
 input_dir = 'VIDEOS'
 output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
 os.makedirs(output_dir, exist_ok=True)
-
-# Writing the big .mp4 directly into the nested "ATTENDANCE RESULTS/MINE"
-# folder on the network share was erroring out partway through. Writing it
-# here first (same folder as this script, i.e. EE23B044) and moving the
-# FINISHED file over afterward is much more reliable — only the small/quick
-# CSVs go straight into output_dir, since those write in a fraction of a
-# second and never showed the same problem.
 video_staging_dir = os.path.abspath('.')
 
 to_tensor = transforms.Compose([transforms.Resize((160, 160)), transforms.ToTensor()])
@@ -119,35 +107,26 @@ target_videos = ['2026-04-27_10.02.44.mkv', '2026-02-25_11.23.07.mkv', '2026-03-
 
 
 def save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir):
-    """Phase 4: collapse all tracked identities into a Present/Absent report.
-
-    Pulled into its own function so it can be called BOTH on a normal finish
-    AND from the interrupt/error handler below — so a Ctrl+C or a crash no
-    longer means losing every track this video has already collected.
-    """
     final_mem = {**archived_tracks, **active_track_memory}
     debug_data = []
+    
+    # Track presence AND how many times they were successfully identified
     student_presence = {name: False for name in target_names}
+    student_detection_count = {name: 0 for name in target_names}
 
     for t_id, data in final_mem.items():
-        # 'frames_alive' = real elapsed frames the track was on screen, counted
-        # every frame regardless of FRAME_SKIP (see the main loop). This is what
-        # the 90-frame presence gate below checks against, so raising/lowering
-        # FRAME_SKIP no longer silently changes how hard it is to "Pass" — it
-        # only changes how often recognition runs, not how presence is measured.
         total_frames = data.get('frames_alive', 0)
         recognition_votes = len(data['all_preds'])
         counts = Counter(data['all_preds'])
         winner = counts.most_common(1)[0][0] if data['all_preds'] else "Unknown"
 
-        # recognition_votes can legitimately be 0 (e.g. every crop for this
-        # track failed the blur check) even if total_frames >= 90, so the
-        # confidence-ratio check must be guarded — otherwise this is a
-        # ZeroDivisionError waiting to happen.
         status = "Passed" if (total_frames >= 90 and recognition_votes > 0
                                and (counts.get(winner, 0) / recognition_votes) >= 0.6) else "Failed"
+        
         if status == "Passed" and winner != "Unknown":
             student_presence[winner] = True
+            # Add their winning FaceNet votes to their detection count
+            student_detection_count[winner] += counts.get(winner, 0)
 
         debug_data.append({'Track ID': t_id, 'Start Time': data.get('start_time', ''),
                             'Total Frames': total_frames, 'Recognition Votes': recognition_votes,
@@ -155,13 +134,19 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
                             'Breakdown': dict(counts)})
 
     stem = os.path.splitext(video_filename)[0]
-    # These now land in ATTENDANCE RESULTS/MINE (output_dir), named after the
-    # source video itself (e.g. "2026-03-09_10.03.16_DEBUG_Tracks.csv"), instead
-    # of whatever folder you happened to launch the script from with a "temp_"
-    # prefix — previously output_dir was created (line ~98) but never used.
     pd.DataFrame(debug_data).to_csv(os.path.join(output_dir, f"{stem}_DEBUG_Tracks.csv"))
-    pd.DataFrame([{'Name': s, 'Status': 'Present' if student_presence[s] else 'Absent'}
-                  for s in target_names]).to_csv(os.path.join(output_dir, f"{stem}_output.csv"))
+    
+    # New CSV format with Detection Count included
+    output_data = [
+        {
+            'Name': s, 
+            'Status': 'Present' if student_presence[s] else 'Absent',
+            'Detection Count': student_detection_count[s]
+        }
+        for s in target_names
+    ]
+    pd.DataFrame(output_data).to_csv(os.path.join(output_dir, f"{stem}_output.csv"), index=False)
+    
     print(f"  -> Saved attendance + debug CSVs for {video_filename} ({len(final_mem)} tracks) to {output_dir}")
 
 
@@ -171,6 +156,11 @@ for video_filename in target_videos:
     if not os.path.exists(os.path.join(input_dir, video_filename)): continue
 
     print(f"\nProcessing: {video_filename}")
+    
+    # Initialize YOLO INSIDE the loop. 
+    # This guarantees the ByteTrack tracker is wiped clean, resetting IDs to 1 for every video.
+    yolo_model = YOLO('yolov8n-face.pt', task='detect')
+    
     video_stream = ThreadedVideoReader(os.path.join(input_dir, video_filename)).start()
 
     video_stem = os.path.splitext(video_filename)[0]
@@ -189,24 +179,11 @@ for video_filename in target_videos:
                 # --- BYTE TRACK ---
                 results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
 
-                # Pull boxes/ids off the GPU ONCE per frame and reuse them for
-                # recognition, drawing, AND cleanup below. Previously the drawing
-                # loop called results[0].boxes.id.int().cpu().numpy() fresh on
-                # EVERY detection (i.e. once per face, not once per frame), which
-                # means re-doing a GPU->CPU sync N times instead of once whenever
-                # N faces were on screen. At any real classroom headcount that adds
-                # up fast and was very likely part of why this felt slow.
                 has_detections = results[0].boxes.id is not None
                 if has_detections:
                     boxes = results[0].boxes.xyxy.cpu().numpy()
                     ids = results[0].boxes.id.int().cpu().numpy()
 
-                # Register every visible track and bump its real on-screen frame
-                # count EVERY frame — not just on FRAME_SKIP checkpoints like
-                # before. Previously a track was only created/counted on frames
-                # where frame_count % FRAME_SKIP == 0, so raising FRAME_SKIP
-                # silently shrank "Total Frames" for every track without the
-                # 90-frame Pass/Fail gate changing to match it.
                 if has_detections:
                     for t_id in ids:
                         if t_id not in active_track_memory:
@@ -263,15 +240,10 @@ for video_filename in target_videos:
                 pbar.update(1)
 
     except KeyboardInterrupt:
-        # Ctrl+C: stop this video cleanly instead of letting the raw traceback
-        # blow past out.release() / video_stream.stop() and skip the CSV save.
         print(f"\n[Interrupted] Stopping '{video_filename}' early. "
               f"Saving whatever attendance data was collected before exiting.")
         interrupted = True
     finally:
-        # Runs on a clean finish, a real exception, OR a Ctrl+C — so the reader
-        # thread always gets stopped, the video file always gets a valid footer
-        # written via release(), and you always get a CSV instead of nothing.
         video_stream.stop()
         out.release()
 
