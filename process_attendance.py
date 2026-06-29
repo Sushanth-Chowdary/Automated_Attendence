@@ -200,6 +200,6 @@ def process_attendance(base_dir, target_folder):
 
 if __name__ == "__main__":
     BASE_DIRECTORY = "ATTENDENCE RESULTS/Results"
-    TARGET_FOLDER = "test 11"
+    TARGET_FOLDER = "test 12"
     
     process_attendance(BASE_DIRECTORY, TARGET_FOLDER)

@@ -113,7 +113,7 @@ target_names = saved_data['target_names']
 y_real = saved_data['y_real']
 
 # 4. Define Parameters
-CONFIDENCE_THRESHOLD = 0.70  # Lowered to accommodate unaligned faces
+CONFIDENCE_THRESHOLD = 0.74     
 FRAME_SKIP = 1                
 FRAMES_PER_VOTE = 10          
 REQUIRED_VOTES = 30           
@@ -320,8 +320,8 @@ for video_filename in video_files:
                                     # Extract both the winner's name AND their vote count
                                     top_candidate, top_count = vote_counts.most_common(1)[0]
                                     
-                                    # Demand that the specific candidate got at least 2 consistent votes
-                                    if top_count >= 4:
+                                    # Demand that the specific candidate got at least 7 consistent votes
+                                    if top_count >= 7:
                                         winner = top_candidate
                                     else:
                                         winner = "Unknown"
