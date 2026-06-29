@@ -75,6 +75,13 @@ def crop_standard(img, box):
     x2 = min(img.shape[1], x2 + margin_x); y2 = min(img.shape[0], y2 + margin_y)
     return img[y1:y2, x1:x2]
 
+def format_timestamp(frame_count, fps):
+    """HH:MM:SS position in the video, used to record when a track ID first appeared."""
+    total_seconds = frame_count // fps
+    h, rem = divmod(total_seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
 # 2. Setup
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 yolo_model = YOLO('yolov8n-face.pt', task='detect')
@@ -89,13 +96,21 @@ with open('./face_attendance_meta.pkl', 'rb') as f:
 target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
 # 3. Parameters
-CONFIDENCE_THRESHOLD = 0.72     
+CONFIDENCE_THRESHOLD = 0.74     
 FRAME_SKIP = 5                # INCREASED for massive speed boost
 FRAMES_PER_VOTE = 10          
 
 input_dir = 'VIDEOS'
 output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
 os.makedirs(output_dir, exist_ok=True)
+
+# Writing the big .mp4 directly into the nested "ATTENDANCE RESULTS/MINE"
+# folder on the network share was erroring out partway through. Writing it
+# here first (same folder as this script, i.e. EE23B044) and moving the
+# FINISHED file over afterward is much more reliable — only the small/quick
+# CSVs go straight into output_dir, since those write in a fraction of a
+# second and never showed the same problem.
+video_staging_dir = os.path.abspath('.')
 
 to_tensor = transforms.Compose([transforms.Resize((160, 160)), transforms.ToTensor()])
 
@@ -115,16 +130,29 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
     student_presence = {name: False for name in target_names}
 
     for t_id, data in final_mem.items():
-        total = len(data['all_preds'])
+        # 'frames_alive' = real elapsed frames the track was on screen, counted
+        # every frame regardless of FRAME_SKIP (see the main loop). This is what
+        # the 90-frame presence gate below checks against, so raising/lowering
+        # FRAME_SKIP no longer silently changes how hard it is to "Pass" — it
+        # only changes how often recognition runs, not how presence is measured.
+        total_frames = data.get('frames_alive', 0)
+        recognition_votes = len(data['all_preds'])
         counts = Counter(data['all_preds'])
         winner = counts.most_common(1)[0][0] if data['all_preds'] else "Unknown"
 
-        status = "Passed" if total >= 90 and (counts.get(winner, 0) / total) >= 0.6 else "Failed"
+        # recognition_votes can legitimately be 0 (e.g. every crop for this
+        # track failed the blur check) even if total_frames >= 90, so the
+        # confidence-ratio check must be guarded — otherwise this is a
+        # ZeroDivisionError waiting to happen.
+        status = "Passed" if (total_frames >= 90 and recognition_votes > 0
+                               and (counts.get(winner, 0) / recognition_votes) >= 0.6) else "Failed"
         if status == "Passed" and winner != "Unknown":
             student_presence[winner] = True
 
-        debug_data.append({'Track ID': t_id, 'Total Frames': total, 'Predicted Identity': winner,
-                            'Gate Status': status, 'Breakdown': dict(counts)})
+        debug_data.append({'Track ID': t_id, 'Start Time': data.get('start_time', ''),
+                            'Total Frames': total_frames, 'Recognition Votes': recognition_votes,
+                            'Predicted Identity': winner, 'Gate Status': status,
+                            'Breakdown': dict(counts)})
 
     stem = os.path.splitext(video_filename)[0]
     # These now land in ATTENDANCE RESULTS/MINE (output_dir), named after the
@@ -146,7 +174,8 @@ for video_filename in target_videos:
     video_stream = ThreadedVideoReader(os.path.join(input_dir, video_filename)).start()
 
     video_stem = os.path.splitext(video_filename)[0]
-    out = cv2.VideoWriter(os.path.join(output_dir, f"{video_stem}_output.mp4"), cv2.VideoWriter_fourcc(*'mp4v'), video_stream.fps, (video_stream.frame_width, video_stream.frame_height))
+    staging_video_path = os.path.join(video_staging_dir, f"{video_stem}_output.mp4")
+    out = cv2.VideoWriter(staging_video_path, cv2.VideoWriter_fourcc(*'mp4v'), video_stream.fps, (video_stream.frame_width, video_stream.frame_height))
 
     active_track_memory, archived_tracks, track_identities = {}, {}, {}
     frame_count = 0
@@ -172,13 +201,23 @@ for video_filename in target_videos:
                     boxes = results[0].boxes.xyxy.cpu().numpy()
                     ids = results[0].boxes.id.int().cpu().numpy()
 
+                # Register every visible track and bump its real on-screen frame
+                # count EVERY frame — not just on FRAME_SKIP checkpoints like
+                # before. Previously a track was only created/counted on frames
+                # where frame_count % FRAME_SKIP == 0, so raising FRAME_SKIP
+                # silently shrank "Total Frames" for every track without the
+                # 90-frame Pass/Fail gate changing to match it.
+                if has_detections:
+                    for t_id in ids:
+                        if t_id not in active_track_memory:
+                            active_track_memory[t_id] = {'start_time': format_timestamp(frame_count, video_stream.fps),
+                                                          'frames_alive': 0, 'buffer': [], 'all_preds': []}
+                        active_track_memory[t_id]['frames_alive'] += 1
+
                 if frame_count % FRAME_SKIP == 0 and has_detections:
                     batch_tensors, batch_track_ids = [], []
 
                     for i, t_id in enumerate(ids):
-                        if t_id not in active_track_memory:
-                            active_track_memory[t_id] = {'start_time': f"{frame_count//video_stream.fps}s", 'buffer': [], 'all_preds': []}
-
                         crop = crop_standard(frame, boxes[i])
                         if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 4.0:
                             batch_tensors.append((to_tensor(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(device) - 0.5) * 2)
@@ -235,6 +274,15 @@ for video_filename in target_videos:
         # written via release(), and you always get a CSV instead of nothing.
         video_stream.stop()
         out.release()
+
+        final_video_path = os.path.join(output_dir, f"{video_stem}_output.mp4")
+        try:
+            subprocess.run(['mv', staging_video_path, final_video_path], check=True)
+            print(f"  -> Moved video to {final_video_path}")
+        except subprocess.CalledProcessError as e:
+            print(f"  -> WARNING: video finished but couldn't be moved to {output_dir} ({e}). "
+                  f"It's still saved locally at {staging_video_path} — move it manually.")
+
         save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
 
     if interrupted:
