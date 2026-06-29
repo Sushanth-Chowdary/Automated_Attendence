@@ -98,7 +98,7 @@ target_names, y_real = saved_data['target_names'], saved_data['y_real']
 # 3. Parameters
 CONFIDENCE_THRESHOLD = 0.74     
 FRAME_SKIP = 5                # INCREASED for massive speed boost
-FRAMES_PER_VOTE = 10          
+FRAMES_PER_VOTE = 5          
 
 input_dir = 'VIDEOS'
 output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
