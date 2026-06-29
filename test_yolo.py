@@ -18,7 +18,7 @@ import threading
 import queue
 import gc
 import time 
-import subprocess # <-- Required for native OS file transfers
+import subprocess 
 
 # Tracker Import
 from deep_sort_realtime.deepsort_tracker import DeepSort
@@ -78,7 +78,7 @@ class ThreadedVideoReader:
 
 
 # ==========================================
-# CROP HELPER FUNCTION (Alignment Removed)
+# CROP HELPER FUNCTION 
 # ==========================================
 def crop_standard(img, box):
     """Grabs the raw face with a 15% margin for context."""
@@ -116,7 +116,6 @@ y_real = saved_data['y_real']
 CONFIDENCE_THRESHOLD = 0.74     
 FRAME_SKIP = 1                
 FRAMES_PER_VOTE = 10          
-REQUIRED_VOTES = 30           
 
 input_dir = 'VIDEOS'
 output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
@@ -154,7 +153,6 @@ for video_filename in video_files:
     print(f"Starting processing for: {video_filename}")
     print(f"{'='*50}")
     
-    # --- TRACKER UPDATED: SORT Hack Applied ---
     tracker = DeepSort(max_age=30, n_init=3, embedder=None, max_cosine_distance=1.0)
 
     network_input_path = os.path.join(input_dir, video_filename)
@@ -162,18 +160,15 @@ for video_filename in video_files:
 
     video_output_filename = f"{file_name_no_ext}_output.mp4"
 
-    # LOCAL temporary paths (Writing directly to your Ubuntu machine)
     temp_local_vid = f"./temp_{video_output_filename}" 
     temp_local_att_csv = f"./temp_{file_name_no_ext}_output.csv"
     temp_local_dbg_csv = f"./temp_{file_name_no_ext}_DEBUG_Tracks.csv"
     
-    # FINAL network paths (Where they go when finished)
     final_network_vid = os.path.join(output_dir, video_output_filename)
     final_network_att_csv = os.path.join(output_dir, f"{file_name_no_ext}_output.csv")
     final_network_dbg_csv = os.path.join(output_dir, f"{file_name_no_ext}_DEBUG_Tracks.csv")
 
     print(f"[1/4] Connecting directly to {video_filename} on the network...")
-    # Reading directly from the network to save time
     video_stream = ThreadedVideoReader(network_input_path, queue_size=128).start()
     
     frame_width = video_stream.frame_width
@@ -186,8 +181,6 @@ for video_filename in video_files:
 
     track_visibility = {}  
     track_identities = {}  
-    global_student_votes = {name: 0 for name in target_names}
-    
     active_track_memory = {} 
     archived_tracks = {} 
     
@@ -222,15 +215,13 @@ for video_filename in video_files:
                     
                 detections = []
                 for box, prob in zip(boxes, confs):
-                    if prob > 0.70: 
+                    if prob > 0.66: 
                         x1, y1, x2, y2 = map(int, box)
                         w, h = x2 - x1, y2 - y1
-                        
                         if w >= 50 and h >= 50: 
                             detections.append(([x1, y1, w, h], prob, 'face'))
 
                 t_start = time.time()
-                # --- SORT HACK INJECTION ---
                 dummy_embeds = [np.ones(512) for _ in range(len(detections))]
                 tracks = tracker.update_tracks(detections, embeds=dummy_embeds)
                 profiler['deepsort'] += (time.time() - t_start)
@@ -260,23 +251,19 @@ for video_filename in video_files:
                             if (x2 - x1) < 50 or (y2 - y1) < 50: 
                                 continue
 
-                            # Grab raw face crop
                             face_crop_bgr = crop_standard(frame, track_box)
                             if face_crop_bgr.size == 0:
                                 continue
                                 
-                            # Blur check - Loosened to prevent "Analyzing..." limbo
                             sharpness = cv2.Laplacian(face_crop_bgr, cv2.CV_64F).var()
-                            if sharpness < 8.0:
+                            if sharpness < 4.0:
                                 continue  
                                 
                             try:
                                 face_crop_rgb = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2RGB)
                                 face_crop_pil = Image.fromarray(face_crop_rgb)
-                                
                                 face_tensor = to_tensor(face_crop_pil).unsqueeze(0).to(device)
                                 face_tensor = (face_tensor - 0.5) * 2
-                                
                                 batch_tensors.append(face_tensor)
                                 batch_track_ids.append(t_id)
                             except Exception:
@@ -298,7 +285,6 @@ for video_filename in video_files:
 
                         for i in range(len(batch_track_ids)):
                             t_id = batch_track_ids[i]
-                            
                             similarity_score = distances[i][0]
                             matched_faiss_row = indices[i][0]
                             predicted_label_index = y_real[matched_faiss_row]
@@ -311,28 +297,19 @@ for video_filename in video_files:
                             active_track_memory[t_id]['buffer'].append(predicted_name)
                             active_track_memory[t_id]['all_preds'].append(predicted_name)
 
-                            # --- TRUE CONSENSUS VOTING FIX ---
+                            # REAL-TIME VIDEO DISPLAY LOGIC (Does not affect final CSV attendance)
                             if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
                                 valid_votes = [v for v in active_track_memory[t_id]['buffer'] if v != "Unknown"]
-                                
                                 if valid_votes:
                                     vote_counts = Counter(valid_votes)
-                                    # Extract both the winner's name AND their vote count
                                     top_candidate, top_count = vote_counts.most_common(1)[0]
                                     
-                                    # Demand that the specific candidate got at least 7 consistent votes
-                                    if top_count >= 7:
-                                        winner = top_candidate
-                                    else:
-                                        winner = "Unknown"
+                                    # STRICT SCREEN LOGIC: Must hit 7 out of 10 to display name
+                                    winner = top_candidate if top_count >= 7 else "Unknown"
                                 else:
                                     winner = "Unknown"
                                     
-                                if winner != "Unknown":
-                                    global_student_votes[winner] += 1
-                                    
                                 active_track_memory[t_id]['buffer'] = [] 
-                                
                                 if t_id not in track_identities or winner != "Unknown":
                                     track_identities[t_id] = winner
                         profiler['faiss'] += (time.time() - t_start)
@@ -344,7 +321,6 @@ for video_filename in video_files:
                         continue
                         
                     t_id = track.track_id
-                    
                     if track_visibility.get(t_id, False) == True:
                         x1, y1, x2, y2 = map(int, track.to_ltrb())
                         display_name = track_identities.get(t_id, "Analyzing...")
@@ -374,12 +350,9 @@ for video_filename in video_files:
 
                 if frame_count % 5400 == 0:
                     tqdm.write(
-                        f"\n[DEBUG Profiler - Last 5400 Frames] "
-                        f"YOLO: {profiler['yolo']:.2f}s | "
-                        f"DeepSORT: {profiler['deepsort']:.2f}s | "
-                        f"Crop: {profiler['cropping']:.2f}s | "
-                        f"FaceNet: {profiler['facenet']:.2f}s | "
-                        f"FAISS: {profiler['faiss']:.2f}s"
+                        f"\n[DEBUG] YOLO:{profiler['yolo']:.2f}s | SORT:{profiler['deepsort']:.2f}s | "
+                        f"Crop:{profiler['cropping']:.2f}s | FaceNet:{profiler['facenet']:.2f}s | "
+                        f"FAISS:{profiler['faiss']:.2f}s"
                     )
                     for k in profiler:
                         profiler[k] = 0.0
@@ -392,33 +365,34 @@ for video_filename in video_files:
         
         if 'video_stream' in locals():
             video_stream.stop()
-            
         if out is not None:
             out.release()
         
         final_memory = {**archived_tracks, **active_track_memory}
 
         # ==========================================
-        # PHASE 4: SAVING AND TRANSFERRING
+        # PHASE 4: DYNAMIC ATTENDANCE CALCULATION
         # ==========================================
         print(f"      Generating Attendance and Debug CSVs locally...")
         
-        attendance_records = []
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        for student in target_names:
-            votes = global_student_votes.get(student, 0)
-            status = 'Present' if votes >= REQUIRED_VOTES else 'Absent'
-            attendance_records.append({'Name': student, 'Time': current_time, 'Status': status, 'Detection Count': votes})
-
+        MIN_TRACK_FRAMES = 90    # Track must exist for at least 90 frames (~3 seconds) to be considered
+        MATCH_PERCENTAGE = 0.60  # 60% of the track must belong to one identity
+        
+        student_presence = {name: False for name in target_names}
+        student_best_track = {name: 0 for name in target_names}
+        
         debug_records = []
+        
         for t_id, data in final_memory.items():
-            if len(data['all_preds']) == 0:
+            total_preds = len(data['all_preds'])
+            
+            if total_preds == 0:
                 debug_records.append({
-                    'Track ID': t_id,
+                    'Track ID': t_id, 
                     'First Seen': data['start_time'],
-                    'Total Frames': 0,
-                    'Predicted Identity': "Rejected (Blurry)",
+                    'Total Frames': 0, 
+                    'Predicted Identity': "Rejected (Blurry)", 
+                    'Gate Status': "Failed (No Valid Faces)",
                     'Breakdown': {}
                 })
                 continue
@@ -426,56 +400,75 @@ for video_filename in video_files:
             overall_counts = Counter(data['all_preds'])
             true_identity = overall_counts.most_common(1)[0][0]
             
+            gate_status = "Passed"
+            
+            # --- PERCENTAGE LIFESPAN LOGIC ---
+            if total_preds >= MIN_TRACK_FRAMES:
+                valid_counts = {k: v for k, v in overall_counts.items() if k not in ["Unknown", "Analyzing..."]}
+                
+                if valid_counts:
+                    top_candidate = max(valid_counts, key=valid_counts.get)
+                    top_count = valid_counts[top_candidate]
+                    
+                    if (top_count / total_preds) >= MATCH_PERCENTAGE:
+                        student_presence[top_candidate] = True
+                        # Log the highest confidence track for this student
+                        if top_count > student_best_track[top_candidate]:
+                            student_best_track[top_candidate] = top_count
+                    else:
+                        gate_status = f"Failed (Match < {int(MATCH_PERCENTAGE*100)}%)"
+                else:
+                    gate_status = "Failed (Only Unknowns)"
+            else:
+                gate_status = f"Failed (< {MIN_TRACK_FRAMES} Frames)"
+
+            # ALL tracks get logged to the debug file, regardless of Gate Status
             debug_records.append({
                 'Track ID': t_id,
                 'First Seen': data['start_time'],
-                'Total Frames': len(data['all_preds']),
+                'Total Frames': total_preds,
                 'Predicted Identity': true_identity,
+                'Gate Status': gate_status,
                 'Breakdown': dict(overall_counts)
             })
+
+        attendance_records = []
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for student in target_names:
+            status = 'Present' if student_presence[student] else 'Absent'
+            attendance_records.append({
+                'Name': student, 
+                'Time': current_time, 
+                'Status': status, 
+                'Max Track Confidence Frames': student_best_track[student]
+            })
             
-        # WRITE EVERYTHING LOCALLY FIRST
         pd.DataFrame(attendance_records).to_csv(temp_local_att_csv, index=False)
         pd.DataFrame(debug_records).to_csv(temp_local_dbg_csv, index=False)
 
-        # MOVE EVERYTHING TO THE NETWORK USING NATIVE OS COMMANDS
         print(f"      Moving all processed files to network folder...")
         os.makedirs(os.path.dirname(final_network_vid), exist_ok=True)
         
-        files_to_move = [
-            (temp_local_vid, final_network_vid),
-            (temp_local_att_csv, final_network_att_csv),
-            (temp_local_dbg_csv, final_network_dbg_csv)
-        ]
-        
+        files_to_move = [(temp_local_vid, final_network_vid), (temp_local_att_csv, final_network_att_csv), (temp_local_dbg_csv, final_network_dbg_csv)]
         for local_src, net_dest in files_to_move:
             if os.path.exists(local_src):
                 try:
                     subprocess.run(['mv', local_src, net_dest], check=True)
                 except subprocess.CalledProcessError:
-                    print(f"      [!] Native move failed for {local_src}. Rescuing to local home drive...")
                     rescue_path = os.path.join(os.path.expanduser('~'), f"RESCUED_{os.path.basename(local_src)}")
-                    try:
-                        subprocess.run(['mv', local_src, rescue_path], check=True)
-                    except Exception:
-                        pass
+                    subprocess.run(['mv', local_src, rescue_path], check=False)
 
         print(f"[4/4] Cleaning up local temporary files and resetting memory...")
-        try:
-            for local_src, _ in files_to_move:
-                if os.path.exists(local_src):
-                    os.remove(local_src)
-        except Exception:
-            pass
+        for local_src, _ in files_to_move:
+            if os.path.exists(local_src):
+                os.remove(local_src)
             
-        if 'tracker' in locals():
-            del tracker
-        if 'video_stream' in locals():
-            del video_stream
+        if 'tracker' in locals(): del tracker
+        if 'video_stream' in locals(): del video_stream
             
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
             
         print(f"\n*** Process completely finished for {video_filename}! ***\n")
 
