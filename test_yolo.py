@@ -78,7 +78,8 @@ def format_timestamp(frame_count, fps):
 
 # 2. Setup
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device).half()
+# CHANGED: Removed .half() to keep FaceNet in FP32
+resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
 faiss_index_path = './face_attendance_faiss.bin'
 index = faiss.read_index(faiss_index_path)
@@ -211,7 +212,8 @@ for video_filename in target_videos:
 
                     if batch_tensors:
                         with torch.no_grad():
-                            embeddings = resnet(torch.cat(batch_tensors, dim=0).half()).cpu().numpy().astype('float32')
+                            # CHANGED: Removed .half() before passing to model to process in FP32
+                            embeddings = resnet(torch.cat(batch_tensors, dim=0)).cpu().numpy().astype('float32')
                         faiss.normalize_L2(embeddings)
                         sims, indices = index.search(embeddings, k=1)
 
