@@ -13,8 +13,6 @@ import os
 from tqdm import tqdm  
 from collections import Counter
 import faiss
-import gc
-import time 
 import subprocess 
 import threading
 import queue
@@ -92,7 +90,7 @@ target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
 # 3. Parameters
 CONFIDENCE_THRESHOLD = 0.74     
-FRAME_SKIP = 5                
+FRAME_SKIP = 4                 
 FRAMES_PER_VOTE = 5          
 
 input_dir = 'VIDEOS'
@@ -105,38 +103,51 @@ to_tensor = transforms.Compose([transforms.Resize((160, 160)), transforms.ToTens
 # 4. Processing Loop
 target_videos = ['2026-04-27_10.02.44.mkv', '2026-02-25_11.23.07.mkv', '2026-03-05_11.02.28.mkv', '2026-03-09_10.03.16.mkv', '2026-04-07_09.18.02.mkv', 'video2.mkv', '2026-02-25_11.21.17.mkv', '2026-03-09_10.04.35.mkv', '2026-02-25_11.03.43.mkv', '2026-02-18_11.02.03.mkv', 'video1_uajX8qg0.mp4', '2026-02-25_11.00.04.mkv', '2026-02-25_11.15.41.mkv', '2026-03-02_09.55.37.mkv']
 
-
 def save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir):
     final_mem = {**archived_tracks, **active_track_memory}
     debug_data = []
     
-    # Track presence AND how many times they were successfully identified
     student_presence = {name: False for name in target_names}
     student_detection_count = {name: 0 for name in target_names}
 
     for t_id, data in final_mem.items():
         total_frames = data.get('frames_alive', 0)
-        recognition_votes = len(data['all_preds'])
-        counts = Counter(data['all_preds'])
-        winner = counts.most_common(1)[0][0] if data['all_preds'] else "Unknown"
-
-        status = "Passed" if (total_frames >= 90 and recognition_votes > 0
-                               and (counts.get(winner, 0) / recognition_votes) >= 0.6) else "Failed"
+        all_preds = data['all_preds']
         
+        # Filter out "Unknown" for the STRICT BACKEND logic
+        valid_preds = [p for p in all_preds if p != "Unknown"]
+        valid_votes_count = len(valid_preds)
+        
+        if valid_votes_count > 0:
+            counts = Counter(valid_preds)
+            winner = counts.most_common(1)[0][0]
+            
+            win_ratio = counts.get(winner, 0) / valid_votes_count
+            # Strict Gate: 45 frames, 3 valid votes minimum, 60% consensus
+            status = "Passed" if (total_frames >= 45 and valid_votes_count >= 3 and win_ratio >= 0.6) else "Failed"
+        else:
+            winner = "Unknown"
+            status = "Failed"
+            counts = Counter(all_preds) 
+
         if status == "Passed" and winner != "Unknown":
             student_presence[winner] = True
-            # Add their winning FaceNet votes to their detection count
             student_detection_count[winner] += counts.get(winner, 0)
 
-        debug_data.append({'Track ID': t_id, 'Start Time': data.get('start_time', ''),
-                            'Total Frames': total_frames, 'Recognition Votes': recognition_votes,
-                            'Predicted Identity': winner, 'Gate Status': status,
-                            'Breakdown': dict(counts)})
+        debug_data.append({
+            'Track ID': t_id, 
+            'Start Time': data.get('start_time', ''),
+            'Total Frames': total_frames, 
+            'Valid Votes': valid_votes_count,
+            'Total Preds (inc. Unknown)': len(all_preds),
+            'Predicted Identity': winner, 
+            'Gate Status': status,
+            'Breakdown': dict(Counter(all_preds))
+        })
 
     stem = os.path.splitext(video_filename)[0]
     pd.DataFrame(debug_data).to_csv(os.path.join(output_dir, f"{stem}_DEBUG_Tracks.csv"))
     
-    # New CSV format with Detection Count included
     output_data = [
         {
             'Name': s, 
@@ -147,8 +158,7 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
     ]
     pd.DataFrame(output_data).to_csv(os.path.join(output_dir, f"{stem}_output.csv"), index=False)
     
-    print(f"  -> Saved attendance + debug CSVs for {video_filename} ({len(final_mem)} tracks) to {output_dir}")
-
+    print(f"  -> Saved attendance + debug CSVs for {video_filename}")
 
 interrupted = False
 
@@ -157,8 +167,7 @@ for video_filename in target_videos:
 
     print(f"\nProcessing: {video_filename}")
     
-    # Initialize YOLO INSIDE the loop. 
-    # This guarantees the ByteTrack tracker is wiped clean, resetting IDs to 1 for every video.
+    # Initialize YOLO inside the loop to reset track IDs for every video
     yolo_model = YOLO('yolov8n-face.pt', task='detect')
     
     video_stream = ThreadedVideoReader(os.path.join(input_dir, video_filename)).start()
@@ -212,9 +221,14 @@ for video_filename in target_videos:
                             active_track_memory[t_id]['all_preds'].append(name)
 
                             if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
-                                votes = [v for v in active_track_memory[t_id]['buffer'] if v != "Unknown"]
-                                top_candidate, top_count = Counter(votes).most_common(1)[0] if votes else ("Unknown", 0)
-                                winner = top_candidate if top_count >= 7 else "Unknown"
+                                # LOOSE UI: Look at ALL valid predictions for this track so far
+                                valid_history = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
+                                
+                                if valid_history:
+                                    winner = Counter(valid_history).most_common(1)[0][0]
+                                else:
+                                    winner = "Unknown"
+                                    
                                 track_identities[t_id] = winner
                                 active_track_memory[t_id]['buffer'] = []
 
