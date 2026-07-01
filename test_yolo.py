@@ -91,8 +91,8 @@ target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
 # 3. Parameters
 CONFIDENCE_THRESHOLD = 0.74     
-FRAME_SKIP = 4                 
-FRAMES_PER_VOTE = 5          
+FRAME_SKIP = 3                 
+FRAMES_PER_VOTE = 10          
 
 input_dir = 'VIDEOS'
 output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
