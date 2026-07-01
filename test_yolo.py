@@ -90,9 +90,9 @@ with open('./face_attendance_meta.pkl', 'rb') as f:
 target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
 # 3. Parameters
-CONFIDENCE_THRESHOLD = 0.74     
+CONFIDENCE_THRESHOLD = 0.76     
 FRAME_SKIP = 3                 
-FRAMES_PER_VOTE = 10          
+FRAMES_PER_VOTE = 5          
 
 input_dir = 'VIDEOS'
 output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
@@ -125,7 +125,7 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
             
             win_ratio = counts.get(winner, 0) / valid_votes_count
             # Strict Gate: 45 frames, 3 valid votes minimum, 60% consensus
-            status = "Passed" if (total_frames >= 45 and valid_votes_count >= 3 and win_ratio >= 0.6) else "Failed"
+            status = "Passed" if (total_frames >= 45 and valid_votes_count >= 5 and win_ratio >= 0.6) else "Failed"
         else:
             winner = "Unknown"
             status = "Failed"
