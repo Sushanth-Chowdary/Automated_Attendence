@@ -165,9 +165,9 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
 # ==========================================
 # CONFIGURATION & PARAMETERS
 # ==========================================
-CONFIDENCE_THRESHOLD = 0.76     [cite: 21]
-FRAME_SKIP = 3                 [cite: 21]
-FRAMES_PER_VOTE = 5            [cite: 21]
+CONFIDENCE_THRESHOLD = 0.76    
+FRAME_SKIP = 3                
+FRAMES_PER_VOTE = 5
 
 input_dir = './test_videos'
 output_dir = './output_results'
