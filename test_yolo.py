@@ -90,7 +90,7 @@ target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
 # 3. Parameters (Updated)
 CONFIDENCE_THRESHOLD = 0.78     
-FRAME_SKIP = 2                 
+FRAME_SKIP = 2                  
 FRAMES_PER_VOTE = 5          
 
 input_dir = 'VIDEOS'
@@ -123,10 +123,10 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
             sample_ratio = counts.get(winner, 0) / total_samples if total_samples > 0 else 0
             
             # The Updated Strict Gate: Replaced valid_votes_count with total_samples minimum
-            status = "Passed" if (total_frames >= 60 and 
+            status = "Passed" if (total_frames >= 45 and 
                                   total_samples >= 15 and 
-                                  sample_ratio >= 0.25 and 
-                                  win_ratio >= 0.60) else "Failed"
+                                  sample_ratio >= 0.30 and 
+                                  win_ratio >= 0.55) else "Failed"
         else:
             winner = "Unknown"
             status = "Failed"
@@ -186,7 +186,7 @@ for video_filename in target_videos:
                     batch_tensors, batch_track_ids = [], []
                     for i, t_id in enumerate(ids):
                         crop = crop_standard(frame, boxes[i])
-                        if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 4.0:
+                        if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 4.5:
                             batch_tensors.append((to_tensor(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(device) - 0.5) * 2)
                             batch_track_ids.append(t_id)
 
