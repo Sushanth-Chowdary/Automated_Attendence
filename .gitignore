@@ -15,4 +15,5 @@ Results/
 *.pt
 *.onnx
 *.engine
+*.mp4
 .vscode
