@@ -88,9 +88,9 @@ with open('./face_attendance_meta.pkl', 'rb') as f:
     saved_data = pickle.load(f)
 target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
-# 3. Parameters
-CONFIDENCE_THRESHOLD = 0.76     
-FRAME_SKIP = 3                 
+# 3. Parameters (Updated)
+CONFIDENCE_THRESHOLD = 0.78     
+FRAME_SKIP = 2                 
 FRAMES_PER_VOTE = 5          
 
 input_dir = 'VIDEOS'
@@ -122,9 +122,9 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
             total_samples = len(all_preds)
             sample_ratio = counts.get(winner, 0) / total_samples if total_samples > 0 else 0
             
-            # The Ultimate 4-Condition Strict Gate
-            status = "Passed" if (total_frames >= 45 and 
-                                  valid_votes_count >= 5 and 
+            # The Updated Strict Gate: Replaced valid_votes_count with total_samples minimum
+            status = "Passed" if (total_frames >= 60 and 
+                                  total_samples >= 15 and 
                                   sample_ratio >= 0.25 and 
                                   win_ratio >= 0.60) else "Failed"
         else:
