@@ -234,6 +234,8 @@ for video_filename in target_videos:
     finally:
         video_stream.stop()
         out.release()
+        
+        final_video_path = os.path.join(output_dir, f"{video_stem}_output.mp4")
         try: subprocess.run(['mv', staging_video_path, final_video_path], check=True)
         except: pass
         save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
