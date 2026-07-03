@@ -185,6 +185,24 @@ for video_filename in target_videos:
                 if frame_count % FRAME_SKIP == 0 and has_detections:
                     batch_tensors, batch_track_ids = [], []
                     for i, t_id in enumerate(ids):
+                        
+                        # --- GEOMETRIC GATE START ---
+                        x1, y1, x2, y2 = boxes[i]
+                        box_w = x2 - x1
+                        box_h = y2 - y1
+                        
+                        MIN_WIDTH = 45  # Minimum width in pixels
+                        MIN_HEIGHT = 45 # Minimum height in pixels
+                        
+                        aspect_ratio = box_w / box_h if box_h > 0 else 0
+                        
+                        if box_w < MIN_WIDTH or box_h < MIN_HEIGHT:
+                            continue 
+                            
+                        if aspect_ratio < 0.45 or aspect_ratio > 1.6:
+                            continue 
+                        # --- GEOMETRIC GATE END ---
+
                         crop = crop_standard(frame, boxes[i])
                         if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 4.5:
                             batch_tensors.append((to_tensor(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(device) - 0.5) * 2)
