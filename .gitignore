@@ -17,3 +17,4 @@ Results/
 *.engine
 *.mp4
 .vscode
+*.yaml

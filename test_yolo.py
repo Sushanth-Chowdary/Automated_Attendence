@@ -170,7 +170,7 @@ for video_filename in target_videos:
             while video_stream.more():
                 frame = video_stream.read()
                 if frame is None: break 
-                results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False, track_buffer=45)
+                results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False)
                 has_detections = results[0].boxes.id is not None
                 if has_detections:
                     boxes = results[0].boxes.xyxy.cpu().numpy()
