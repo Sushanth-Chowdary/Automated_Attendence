@@ -122,7 +122,6 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
             total_samples = len(all_preds)
             sample_ratio = counts.get(winner, 0) / total_samples if total_samples > 0 else 0
             
-            # The Updated Strict Gate: Replaced valid_votes_count with total_samples minimum
             status = "Passed" if (total_frames >= 45 and 
                                   total_samples >= 15 and 
                                   sample_ratio >= 0.30 and 
@@ -171,7 +170,7 @@ for video_filename in target_videos:
             while video_stream.more():
                 frame = video_stream.read()
                 if frame is None: break 
-                results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
+                results = yolo_model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False, track_buffer=45)
                 has_detections = results[0].boxes.id is not None
                 if has_detections:
                     boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -191,8 +190,8 @@ for video_filename in target_videos:
                         box_w = x2 - x1
                         box_h = y2 - y1
                         
-                        MIN_WIDTH = 45  # Minimum width in pixels
-                        MIN_HEIGHT = 45 # Minimum height in pixels
+                        MIN_WIDTH = 45  
+                        MIN_HEIGHT = 45 
                         
                         aspect_ratio = box_w / box_h if box_h > 0 else 0
                         
@@ -233,13 +232,13 @@ for video_filename in target_videos:
                         cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 out.write(frame)
 
-                # --- Memory Cleanup with 15-Frame Grace Period ---
+                # --- Memory Cleanup with 50-Frame Safety Grace Period ---
                 alive_ids = set(ids) if has_detections else set()
                 for t_id in list(active_track_memory.keys()):
                     if t_id not in alive_ids:
                         active_track_memory[t_id]['missing_frames'] += 1
-                        # Wait for up to 15 frames before killing the track
-                        if active_track_memory[t_id]['missing_frames'] > 15:
+                        # Wait for up to 50 frames to match the new track_buffer alignment safely
+                        if active_track_memory[t_id]['missing_frames'] > 50:
                             archived_tracks[t_id] = active_track_memory.pop(t_id)
                     else:
                         active_track_memory[t_id]['missing_frames'] = 0
