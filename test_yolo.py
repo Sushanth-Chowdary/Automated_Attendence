@@ -89,7 +89,7 @@ with open('./face_attendance_meta.pkl', 'rb') as f:
 target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
 # 3. Parameters (Updated)
-CONFIDENCE_THRESHOLD = 0.78     
+CONFIDENCE_THRESHOLD = 0.80     
 FRAME_SKIP = 2                  
 FRAMES_PER_VOTE = 5          
 
@@ -124,8 +124,8 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
             
             status = "Passed" if (total_frames >= 45 and 
                                   total_samples >= 15 and 
-                                  sample_ratio >= 0.30 and 
-                                  win_ratio >= 0.55) else "Failed"
+                                  sample_ratio >= 0.32 and 
+                                  win_ratio >= 0.53) else "Failed"
         else:
             winner = "Unknown"
             status = "Failed"
@@ -190,20 +190,20 @@ for video_filename in target_videos:
                         box_w = x2 - x1
                         box_h = y2 - y1
                         
-                        MIN_WIDTH = 45  
-                        MIN_HEIGHT = 45 
+                        MIN_WIDTH = 60  
+                        MIN_HEIGHT = 60 
                         
                         aspect_ratio = box_w / box_h if box_h > 0 else 0
                         
                         if box_w < MIN_WIDTH or box_h < MIN_HEIGHT:
                             continue 
                             
-                        if aspect_ratio < 0.45 or aspect_ratio > 1.6:
+                        if aspect_ratio < 0.5 or aspect_ratio > 1.5:
                             continue 
                         # --- GEOMETRIC GATE END ---
 
                         crop = crop_standard(frame, boxes[i])
-                        if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 4.5:
+                        if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 5.0:
                             batch_tensors.append((to_tensor(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(device) - 0.5) * 2)
                             batch_track_ids.append(t_id)
 
