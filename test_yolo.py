@@ -88,9 +88,9 @@ with open('./face_attendance_meta.pkl', 'rb') as f:
     saved_data = pickle.load(f)
 target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
-# 3. Parameters (Updated)
+# 3. Parameters
 CONFIDENCE_THRESHOLD = 0.79     
-FRAME_SKIP = 2                  
+FRAME_SKIP = 1                  
 FRAMES_PER_VOTE = 5          
 
 input_dir = 'VIDEOS'
