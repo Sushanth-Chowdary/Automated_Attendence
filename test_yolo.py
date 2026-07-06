@@ -89,7 +89,7 @@ with open('./face_attendance_meta.pkl', 'rb') as f:
 target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
 # 3. Parameters (Updated)
-CONFIDENCE_THRESHOLD = 0.76     
+CONFIDENCE_THRESHOLD = 0.79     
 FRAME_SKIP = 2                  
 FRAMES_PER_VOTE = 5          
 
@@ -198,7 +198,7 @@ for video_filename in target_videos:
                         if box_w < MIN_WIDTH or box_h < MIN_HEIGHT:
                             continue 
                             
-                        if aspect_ratio < 0.5 or aspect_ratio > 1.5:
+                        if aspect_ratio < 0.55 or aspect_ratio > 1.55:
                             continue 
                         # --- GEOMETRIC GATE END ---
 
