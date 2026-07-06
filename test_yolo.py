@@ -2,10 +2,8 @@
 import torch
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
-import torchvision.transforms as transforms
 import cv2
 import numpy as np
-from PIL import Image
 import pickle
 import pandas as pd
 from datetime import datetime
@@ -78,7 +76,12 @@ def format_timestamp(frame_count, fps):
 
 # 2. Setup
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+use_half = torch.cuda.is_available() # Enable FP16 only if GPU is available
+
+# Initialize ResNet and convert to half-precision if on GPU
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+if use_half:
+    resnet = resnet.half()
 
 faiss_index_path = './face_attendance_faiss.bin'
 index = faiss.read_index(faiss_index_path)
@@ -97,8 +100,6 @@ input_dir = 'VIDEOS'
 output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
 os.makedirs(output_dir, exist_ok=True)
 video_staging_dir = os.path.abspath('.')
-
-to_tensor = transforms.Compose([transforms.Resize((160, 160)), transforms.ToTensor()])
 
 # 4. Processing Loop
 target_videos = ['2026-04-27_10.02.44.mkv', '2026-02-25_11.23.07.mkv', '2026-03-05_11.02.28.mkv', '2026-03-09_10.03.16.mkv', '2026-04-07_09.18.02.mkv', 'video2.mkv', '2026-02-25_11.21.17.mkv', '2026-03-09_10.04.35.mkv', '2026-02-25_11.03.43.mkv', '2026-02-18_11.02.03.mkv', 'video1_uajX8qg0.mp4', '2026-02-25_11.00.04.mkv', '2026-02-25_11.15.41.mkv', '2026-03-02_09.55.37.mkv']
@@ -170,8 +171,10 @@ for video_filename in target_videos:
             while video_stream.more():
                 frame = video_stream.read()
                 if frame is None: break 
+                
                 results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False)
                 has_detections = results[0].boxes.id is not None
+                
                 if has_detections:
                     boxes = results[0].boxes.xyxy.cpu().numpy()
                     ids = results[0].boxes.id.int().cpu().numpy()
@@ -182,10 +185,8 @@ for video_filename in target_videos:
                         active_track_memory[t_id]['frames_alive'] += 1
 
                 if frame_count % FRAME_SKIP == 0 and has_detections:
-                    batch_tensors, batch_track_ids = [], []
+                    batch_arrays, batch_track_ids = [], []
                     for i, t_id in enumerate(ids):
-                        
-                        # --- GEOMETRIC GATE START ---
                         x1, y1, x2, y2 = boxes[i]
                         box_w = x2 - x1
                         box_h = y2 - y1
@@ -200,16 +201,28 @@ for video_filename in target_videos:
                             
                         if aspect_ratio < 0.55 or aspect_ratio > 1.55:
                             continue 
-                        # --- GEOMETRIC GATE END ---
 
                         crop = crop_standard(frame, boxes[i])
                         if crop.size > 0 and cv2.Laplacian(crop, cv2.CV_64F).var() > 5.0:
-                            batch_tensors.append((to_tensor(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(device) - 0.5) * 2)
+                            rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                            resized_crop = cv2.resize(rgb_crop, (160, 160))
+                            batch_arrays.append(resized_crop)
                             batch_track_ids.append(t_id)
 
-                    if batch_tensors:
+                    if batch_arrays:
+                        batch_np = np.stack(batch_arrays)
+                        batch_tensor = torch.from_numpy(batch_np).permute(0, 3, 1, 2).to(device)
+                        
+                        if use_half:
+                            batch_tensor = batch_tensor.half()
+                        else:
+                            batch_tensor = batch_tensor.float()
+                            
+                        batch_tensor = (batch_tensor / 255.0 - 0.5) * 2.0
+
                         with torch.no_grad():
-                            embeddings = resnet(torch.cat(batch_tensors, dim=0)).cpu().numpy().astype('float32')
+                            embeddings = resnet(batch_tensor).cpu().numpy().astype('float32')
+                            
                         faiss.normalize_L2(embeddings)
                         sims, indices = index.search(embeddings, k=1)
                         for i, t_id in enumerate(batch_track_ids):
@@ -231,13 +244,10 @@ for video_filename in target_videos:
                         cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
                         cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 out.write(frame)
-
-                # --- Memory Cleanup with 50-Frame Safety Grace Period ---
                 alive_ids = set(ids) if has_detections else set()
                 for t_id in list(active_track_memory.keys()):
                     if t_id not in alive_ids:
                         active_track_memory[t_id]['missing_frames'] += 1
-                        # Wait for up to 50 frames to match the new track_buffer alignment safely
                         if active_track_memory[t_id]['missing_frames'] > 50:
                             archived_tracks[t_id] = active_track_memory.pop(t_id)
                     else:
