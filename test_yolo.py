@@ -92,7 +92,7 @@ with open('./face_attendance_meta.pkl', 'rb') as f:
 target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
 # 3. Parameters
-CONFIDENCE_THRESHOLD = 0.79     
+CONFIDENCE_THRESHOLD = 0.78     
 FRAME_SKIP = 1                  
 FRAMES_PER_VOTE = 5          
 
@@ -124,7 +124,7 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
             sample_ratio = counts.get(winner, 0) / total_samples if total_samples > 0 else 0
             
             status = "Passed" if (total_frames >= 45 and 
-                                  total_samples >= 15 and 
+                                  total_samples >= 30 and 
                                   sample_ratio >= 0.33 and 
                                   win_ratio >= 0.52) else "Failed"
         else:
@@ -199,7 +199,7 @@ for video_filename in target_videos:
                         if box_w < MIN_WIDTH or box_h < MIN_HEIGHT:
                             continue 
                             
-                        if aspect_ratio < 0.55 or aspect_ratio > 1.55:
+                        if aspect_ratio < 0.45 or aspect_ratio > 1.55:
                             continue 
 
                         crop = crop_standard(frame, boxes[i])
