@@ -2,7 +2,12 @@ import cv2
 import os
 import torch
 import numpy as np
+import shutil
 from ultralytics import YOLO
+import hdbscan
+from PIL import Image
+from facenet_pytorch import InceptionResnetV1
+from torchvision import transforms
 
 # ==========================================
 # CROP HELPER FUNCTION
@@ -39,11 +44,13 @@ yolo_model = YOLO('yolov8n-face.pt', task='detect')
 # Configuration
 videos_dir = './videos'              
 base_output_dir = './extracted_faces' 
+clustered_output_dir = './clustered_faces'
 
 os.makedirs(base_output_dir, exist_ok=True)
+os.makedirs(clustered_output_dir, exist_ok=True)
 
 # ==========================================
-# 2. PROCESSING LOOP
+# 2. PROCESSING LOOP (FACE EXTRACTION)
 # ==========================================
 print("Scanning the 'videos' folder...")
 
@@ -108,4 +115,70 @@ else:
         cap.release()
         print(f"Done! Saved {saved_faces} standardized 160x160 faces for {person_name}.")
 
-print("\nAll videos have been processed successfully!")
+print("\nFace extraction completed successfully!")
+
+# ==========================================
+# 3. GENERATE EMBEDDINGS (FACENET)
+# ==========================================
+print("\n--- Starting Embedding Generation ---")
+# Load FaceNet model
+resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+
+# Standard transformation for FaceNet (scales pixel values)
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+
+image_paths = []
+embeddings = []
+
+# Gather all saved faces
+for root, dirs, files in os.walk(base_output_dir):
+    for file in files:
+        if file.lower().endswith('.jpg'):
+            img_path = os.path.join(root, file)
+            image_paths.append(img_path)
+
+print(f"Found {len(image_paths)} faces to cluster.")
+
+# Extract embeddings
+with torch.no_grad():
+    for img_path in image_paths:
+        # Load image with PIL (convert to RGB because cv2 saves in BGR)
+        img = Image.open(img_path).convert('RGB')
+        img_tensor = transform(img).unsqueeze(0).to(device) # Add batch dimension
+        
+        # Get embedding vector
+        emb = resnet(img_tensor).cpu().numpy().flatten()
+        embeddings.append(emb)
+
+embeddings = np.array(embeddings)
+
+# ==========================================
+# 4. HDBSCAN CLUSTERING & ORGANIZATION
+# ==========================================
+if len(embeddings) > 0:
+    print("\n--- Running HDBSCAN Clustering ---")
+    
+    # Configure HDBSCAN (tweak min_cluster_size based on your dataset size)
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=3, metric='euclidean', cluster_selection_method='eom')
+    labels = clusterer.fit_predict(embeddings)
+    
+    unique_labels = set(labels)
+    print(f"Found {len(unique_labels) - (1 if -1 in labels else 0)} clusters (excluding noise).")
+    
+    # Move images to their respective cluster folders
+    for img_path, label in zip(image_paths, labels):
+        # label -1 is used by HDBSCAN for noisy/unclustered data
+        folder_name = "noise" if label == -1 else f"cluster_{label}"
+        
+        cluster_folder_path = os.path.join(clustered_output_dir, folder_name)
+        os.makedirs(cluster_folder_path, exist_ok=True)
+        
+        # Copy the image to the new clustered directory
+        shutil.copy(img_path, cluster_folder_path)
+
+    print(f"Clustering finished! Images organized in: {clustered_output_dir}")
+else:
+    print("No embeddings were generated. Skipping clustering.")
