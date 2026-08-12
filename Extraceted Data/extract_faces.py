@@ -35,10 +35,10 @@ print(f"Running on device: {device}")
 # Load YOLOv8 Face Model
 yolo_model = YOLO('yolov8n-face.pt', task='detect')
 
-# Video path and Output directories
-classroom_video_path = './VIDEOS/classroom_video.mp4' # <--- Change to your video filename
+# Video directory and Output directories
+videos_dir = './VIDEOS/' 
 base_output_dir = './extracted_faces_temp' 
-labels_dir = './LABELS' # Formatted directly for train_yolo.py
+labels_dir = './LABELS' 
 
 os.makedirs(base_output_dir, exist_ok=True)
 if os.path.exists(labels_dir):
@@ -46,47 +46,72 @@ if os.path.exists(labels_dir):
 os.makedirs(labels_dir, exist_ok=True)
 
 # ==========================================
-# 2. MULTI-PERSON FACE EXTRACTION
+# 2. MULTI-PERSON FACE EXTRACTION FROM ALL VIDEOS
 # ==========================================
-print(f"\n--- Extracting ALL faces from: {classroom_video_path} ---")
+print(f"\n--- Extracting ALL faces from videos in: {videos_dir} ---")
 
-cap = cv2.VideoCapture(classroom_video_path)
-frame_count = 0
+image_metadata = [] # Store path, date, and camera info for later
 saved_faces = 0
 frame_skip = 10 # Sample every 10th frame
 
-image_paths = []
-
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+for video_filename in os.listdir(videos_dir):
+    if not video_filename.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+        continue
         
-    frame_count += 1
+    # Parse filename based on standard format shown in your screenshot
+    # Example: 20260807_110016_cam1_raw.mp4
+    parts = video_filename.split('_')
+    if len(parts) >= 3:
+        date_str = parts[0]   # '20260807'
+        cam_str = parts[2]    # 'cam1' or 'cam2'
+    else:
+        date_str = "unknown_date"
+        cam_str = "unknown_cam"
+
+    video_path = os.path.join(videos_dir, video_filename)
+    cap = cv2.VideoCapture(video_path)
+    frame_count = 0
     
-    if frame_count % frame_skip == 0:
-        results = yolo_model(frame, verbose=False)
-        boxes = results[0].boxes.xyxy.cpu().numpy()
-        
-        # PROCESS ALL DETECTED FACES IN THE FRAME
-        for face_idx, box in enumerate(boxes):
-            face_crop_bgr = crop_with_margin(frame, box, margin_percentage=0.15)
+    print(f"Processing {video_filename}...")
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
             
-            if face_crop_bgr.size > 0:
-                final_face_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
+        frame_count += 1
+        
+        if frame_count % frame_skip == 0:
+            results = yolo_model(frame, verbose=False)
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            
+            # PROCESS ALL DETECTED FACES IN THE FRAME
+            for face_idx, box in enumerate(boxes):
+                face_crop_bgr = crop_with_margin(frame, box, margin_percentage=0.15)
                 
-                filename = f"frame_{frame_count}_face_{face_idx}.jpg"
-                save_path = os.path.join(base_output_dir, filename)
-                
-                try:
-                    cv2.imwrite(save_path, final_face_160)
-                    image_paths.append(save_path)
-                    saved_faces += 1
-                except Exception as e:
-                    print(f"Error saving frame {frame_count}: {e}")
+                if face_crop_bgr.size > 0:
+                    final_face_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
+                    
+                    # Prefix with video name to prevent overwriting frames with the same number from different videos
+                    filename = f"{video_filename}_frame_{frame_count}_face_{face_idx}.jpg"
+                    save_path = os.path.join(base_output_dir, filename)
+                    
+                    try:
+                        cv2.imwrite(save_path, final_face_160)
+                        
+                        # Store extraction data for directory structuring later
+                        image_metadata.append({
+                            'path': save_path,
+                            'date': date_str,
+                            'cam': cam_str
+                        })
+                        saved_faces += 1
+                    except Exception as e:
+                        print(f"Error saving frame {frame_count} in {video_filename}: {e}")
 
-cap.release()
-print(f"Done! Saved {saved_faces} total face crops across all detected students.")
+    cap.release()
+
+print(f"Done! Saved {saved_faces} total face crops across all videos.")
 
 # ==========================================
 # 3. GENERATE EMBEDDINGS (FACENET)
@@ -102,8 +127,8 @@ transform = transforms.Compose([
 embeddings = []
 
 with torch.no_grad():
-    for img_path in image_paths:
-        img = Image.open(img_path).convert('RGB')
+    for meta in image_metadata:
+        img = Image.open(meta['path']).convert('RGB')
         img_tensor = transform(img).unsqueeze(0).to(device)
         
         emb = resnet(img_tensor).cpu().numpy().flatten()
@@ -125,16 +150,18 @@ if len(embeddings) > 0:
     num_clusters = len(unique_labels) - (1 if -1 in labels else 0)
     print(f"Found {num_clusters} student clusters (excluding noise).")
     
-    # Move images into ./LABELS/Student_X directories
-    for img_path, label in zip(image_paths, labels):
+    # Move images into ./LABELS/<Date>/<Cam>/Student_X directories
+    for meta, label in zip(image_metadata, labels):
         if label == -1:
             continue # Skip noise
             
         folder_name = f"Student_{label}"
-        target_folder = os.path.join(labels_dir, folder_name)
+        
+        # Construct the targeted nested directory
+        target_folder = os.path.join(labels_dir, meta['date'], meta['cam'], folder_name)
         os.makedirs(target_folder, exist_ok=True)
         
-        shutil.copy(img_path, target_folder)
+        shutil.copy(meta['path'], target_folder)
 
     print(f"\nClustering complete! Organized labels saved to: {labels_dir}")
 else:
