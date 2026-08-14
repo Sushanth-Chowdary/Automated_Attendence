@@ -3,8 +3,9 @@ import os
 import torch
 import numpy as np
 import shutil
-from ultralytics import YOLO
 import hdbscan
+import torch.nn.functional as F
+from ultralytics import YOLO
 from PIL import Image
 from facenet_pytorch import InceptionResnetV1
 from torchvision import transforms
@@ -58,8 +59,7 @@ for video_filename in os.listdir(videos_dir):
     if not video_filename.endswith(('.mp4', '.avi', '.mov', '.mkv')):
         continue
         
-    # Parse filename based on standard format shown in your screenshot
-    # Example: 20260807_110016_cam1_raw.mp4
+    # Parse filename based on standard format (e.g., 20260807_110016_cam1_raw.mp4)
     parts = video_filename.split('_')
     if len(parts) >= 3:
         date_str = parts[0]   # '20260807'
@@ -84,15 +84,25 @@ for video_filename in os.listdir(videos_dir):
         if frame_count % frame_skip == 0:
             results = yolo_model(frame, verbose=False)
             boxes = results[0].boxes.xyxy.cpu().numpy()
+            confs = results[0].boxes.conf.cpu().numpy() # Extract confidence scores
             
             # PROCESS ALL DETECTED FACES IN THE FRAME
-            for face_idx, box in enumerate(boxes):
+            for face_idx, (box, conf) in enumerate(zip(boxes, confs)):
+                
+                # FILTER 1: Reject low-confidence face detections
+                if conf < 0.65:
+                    continue
+                
+                # FILTER 2: Reject faces that are too small (e.g., background faces)
+                x1, y1, x2, y2 = map(int, box)
+                if (x2 - x1) < 40 or (y2 - y1) < 40:
+                    continue
+
                 face_crop_bgr = crop_with_margin(frame, box, margin_percentage=0.15)
                 
                 if face_crop_bgr.size > 0:
                     final_face_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
                     
-                    # Prefix with video name to prevent overwriting frames with the same number from different videos
                     filename = f"{video_filename}_frame_{frame_count}_face_{face_idx}.jpg"
                     save_path = os.path.join(base_output_dir, filename)
                     
@@ -131,7 +141,9 @@ with torch.no_grad():
         img = Image.open(meta['path']).convert('RGB')
         img_tensor = transform(img).unsqueeze(0).to(device)
         
-        emb = resnet(img_tensor).cpu().numpy().flatten()
+        # Get embedding and apply L2 normalization for accurate Euclidean comparison
+        emb = resnet(img_tensor)
+        emb = F.normalize(emb, p=2, dim=1).cpu().numpy().flatten()
         embeddings.append(emb)
 
 embeddings = np.array(embeddings)
@@ -142,8 +154,15 @@ embeddings = np.array(embeddings)
 if len(embeddings) > 0:
     print("\n--- Running HDBSCAN Clustering ---")
     
-    # Adjust min_cluster_size depending on how many frames per student you have
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=5, metric='euclidean', cluster_selection_method='eom')
+    # Adjusted parameters to reduce over-segmentation
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=60,            # Higher threshold to ensure it's a consistent student
+        min_samples=15,                 # Forces borderline/messy images into noise (-1)
+        metric='euclidean', 
+        cluster_selection_epsilon=0.5,  # Merges distinct clusters that are physically close
+        cluster_selection_method='eom'
+    )
+    
     labels = clusterer.fit_predict(embeddings)
     
     unique_labels = set(labels)
