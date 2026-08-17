@@ -33,47 +33,57 @@ def crop_with_margin(img, box, margin_percentage=0.15):
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Running on device: {device}")
 
-# Load YOLOv8 Face Model
+# Load Models
 yolo_model = YOLO('yolov8n-face.pt', task='detect')
+resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
-# Video directory and Output directories
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+
+# Directories
 videos_dir = './VIDEOS/' 
 base_output_dir = './extracted_faces_temp' 
 labels_dir = './LABELS' 
 
+# Reset directories
+if os.path.exists(base_output_dir):
+    shutil.rmtree(base_output_dir)
 os.makedirs(base_output_dir, exist_ok=True)
+
 if os.path.exists(labels_dir):
-    shutil.rmtree(labels_dir) # Clear previous run labels
+    shutil.rmtree(labels_dir)
 os.makedirs(labels_dir, exist_ok=True)
 
-# ==========================================
-# 2. MULTI-PERSON FACE EXTRACTION FROM ALL VIDEOS
-# ==========================================
-print(f"\n--- Extracting ALL faces from videos in: {videos_dir} ---")
+# Restored original frame skip as requested
+frame_skip = 10 
+batch_size = 128
 
-image_metadata = [] # Store path, date, and camera info for later
-saved_faces = 0
-frame_skip = 10 # Sample every 10th frame
+# ==========================================
+# 2. PROCESS VIDEO BY VIDEO
+# ==========================================
+video_files = [f for f in os.listdir(videos_dir) if f.endswith(('.mp4', '.avi', '.mov', '.mkv'))]
 
-for video_filename in os.listdir(videos_dir):
-    if not video_filename.endswith(('.mp4', '.avi', '.mov', '.mkv')):
-        continue
-        
-    # Parse filename based on standard format (e.g., 20260807_110016_cam1_raw.mp4)
+for video_filename in video_files:
+    print(f"\n{'='*50}\nProcessing Video: {video_filename}\n{'='*50}")
+    
+    # Parse filename: 20260807_110016_cam1_raw.mp4
     parts = video_filename.split('_')
     if len(parts) >= 3:
         date_str = parts[0]   # '20260807'
-        cam_str = parts[2]    # 'cam1' or 'cam2'
+        time_str = parts[1]   # '110016'
+        cam_str = parts[2]    # 'cam1'
     else:
-        date_str = "unknown_date"
-        cam_str = "unknown_cam"
+        date_str, time_str, cam_str = "unknown", "unknown", "unknown"
 
     video_path = os.path.join(videos_dir, video_filename)
     cap = cv2.VideoCapture(video_path)
     frame_count = 0
+    saved_faces_this_video = 0
+    image_metadata = [] # Resets for each video
     
-    print(f"Processing {video_filename}...")
-    
+    print("-> Extracting faces...")
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -84,18 +94,14 @@ for video_filename in os.listdir(videos_dir):
         if frame_count % frame_skip == 0:
             results = yolo_model(frame, verbose=False)
             boxes = results[0].boxes.xyxy.cpu().numpy()
-            confs = results[0].boxes.conf.cpu().numpy() # Extract confidence scores
+            confs = results[0].boxes.conf.cpu().numpy()
             
-            # PROCESS ALL DETECTED FACES IN THE FRAME
             for face_idx, (box, conf) in enumerate(zip(boxes, confs)):
-                
-                # FILTER 1: Reject low-confidence face detections
                 if conf < 0.65:
                     continue
                 
-                # FILTER 2: Reject faces that are too small (e.g., background faces)
                 x1, y1, x2, y2 = map(int, box)
-                if (x2 - x1) < 40 or (y2 - y1) < 40:
+                if (x2 - x1) < 45 or (y2 - y1) < 45:
                     continue
 
                 face_crop_bgr = crop_with_margin(frame, box, margin_percentage=0.15)
@@ -103,85 +109,90 @@ for video_filename in os.listdir(videos_dir):
                 if face_crop_bgr.size > 0:
                     final_face_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
                     
-                    filename = f"{video_filename}_frame_{frame_count}_face_{face_idx}.jpg"
+                    filename = f"frame_{frame_count}_face_{face_idx}.jpg"
                     save_path = os.path.join(base_output_dir, filename)
                     
                     try:
                         cv2.imwrite(save_path, final_face_160)
-                        
-                        # Store extraction data for directory structuring later
-                        image_metadata.append({
-                            'path': save_path,
-                            'date': date_str,
-                            'cam': cam_str
-                        })
-                        saved_faces += 1
+                        image_metadata.append(save_path)
+                        saved_faces_this_video += 1
                     except Exception as e:
-                        print(f"Error saving frame {frame_count} in {video_filename}: {e}")
+                        print(f"   Error saving frame {frame_count}: {e}")
 
     cap.release()
+    print(f"   Extracted {saved_faces_this_video} faces.")
 
-print(f"Done! Saved {saved_faces} total face crops across all videos.")
+    # Skip to next video if no faces found
+    if saved_faces_this_video == 0:
+        continue
 
-# ==========================================
-# 3. GENERATE EMBEDDINGS (FACENET)
-# ==========================================
-print("\n--- Starting Embedding Generation ---")
-resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-])
-
-embeddings = []
-
-with torch.no_grad():
-    for meta in image_metadata:
-        img = Image.open(meta['path']).convert('RGB')
-        img_tensor = transform(img).unsqueeze(0).to(device)
-        
-        # Get embedding and apply L2 normalization for accurate Euclidean comparison
-        emb = resnet(img_tensor)
-        emb = F.normalize(emb, p=2, dim=1).cpu().numpy().flatten()
-        embeddings.append(emb)
-
-embeddings = np.array(embeddings)
-
-# ==========================================
-# 4. HDBSCAN CLUSTERING TO CREATING LABELS
-# ==========================================
-if len(embeddings) > 0:
-    print("\n--- Running HDBSCAN Clustering ---")
+    # ------------------------------------------
+    # GENERATE EMBEDDINGS (For this video only)
+    # ------------------------------------------
+    print("-> Generating embeddings...")
+    embeddings = []
     
-    # Adjusted parameters to reduce over-segmentation
+    with torch.no_grad():
+        for i in range(0, len(image_metadata), batch_size):
+            batch_paths = image_metadata[i:i+batch_size]
+            batch_tensors = []
+            
+            for img_path in batch_paths:
+                img = Image.open(img_path).convert('RGB')
+                batch_tensors.append(transform(img))
+                
+            batch_tensor = torch.stack(batch_tensors).to(device)
+            
+            emb_batch = resnet(batch_tensor)
+            emb_batch = F.normalize(emb_batch, p=2, dim=1).cpu().numpy()
+            
+            embeddings.extend(emb_batch)
+
+    embeddings = np.array(embeddings)
+
+    # ------------------------------------------
+    # CLUSTER AND MOVE FILES (For this video only)
+    # ------------------------------------------
+    print("-> Running HDBSCAN Clustering...")
+    
+    # Tuned for a single video with frame_skip=10
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=60,            # Higher threshold to ensure it's a consistent student
-        min_samples=15,                 # Forces borderline/messy images into noise (-1)
+        min_cluster_size=50,            # High because frame_skip=10 captures the same student many times
+        min_samples=15,                 
         metric='euclidean', 
-        cluster_selection_epsilon=0.5,  # Merges distinct clusters that are physically close
+        cluster_selection_epsilon=0.45, 
         cluster_selection_method='eom'
     )
     
     labels = clusterer.fit_predict(embeddings)
-    
     unique_labels = set(labels)
     num_clusters = len(unique_labels) - (1 if -1 in labels else 0)
-    print(f"Found {num_clusters} student clusters (excluding noise).")
     
-    # Move images into ./LABELS/<Date>/<Cam>/Student_X directories
-    for meta, label in zip(image_metadata, labels):
+    print(f"   Found {num_clusters} student clusters.")
+
+    print("-> Moving images to structured folders...")
+    for img_path, label in zip(image_metadata, labels):
         if label == -1:
-            continue # Skip noise
+            continue
             
         folder_name = f"Student_{label}"
         
-        # Construct the targeted nested directory
-        target_folder = os.path.join(labels_dir, meta['date'], meta['cam'], folder_name)
+        # New Output Structure: LABELS/date/cam/time/Student_X/
+        target_folder = os.path.join(labels_dir, date_str, cam_str, time_str, folder_name)
         os.makedirs(target_folder, exist_ok=True)
         
-        shutil.copy(meta['path'], target_folder)
+        shutil.move(img_path, target_folder)
 
-    print(f"\nClustering complete! Organized labels saved to: {labels_dir}")
-else:
-    print("No faces found to cluster.")
+    # Clean out the temp directory so the next video starts fresh
+    for filename in os.listdir(base_output_dir):
+        file_path = os.path.join(base_output_dir, filename)
+        try:
+            if os.path.isfile(file_path):
+                os.unlink(file_path)
+        except Exception as e:
+            pass
+
+print("\n==================================================")
+print("ALL VIDEOS PROCESSED SUCCESSFULLY!")
+print(f"Data saved in: {os.path.abspath(labels_dir)}")
+print("==================================================")

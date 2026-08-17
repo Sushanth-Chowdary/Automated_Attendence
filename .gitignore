@@ -16,5 +16,6 @@ Results/
 *.onnx
 *.engine
 *.mp4
+*.mkv
 .vscode
 *.yaml
