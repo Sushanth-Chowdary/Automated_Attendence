@@ -2,7 +2,7 @@ import cv2
 import os
 import torch
 import numpy as np
-import shutil
+import subprocess
 import hdbscan
 import torch.nn.functional as F
 from ultralytics import YOLO
@@ -48,13 +48,13 @@ videos_dir = f'{target_dir}/VIDEOS/'
 base_output_dir = f'{target_dir}/extracted_faces_temp' 
 labels_dir = f'{target_dir}/LABELS' 
 
-# Reset directories
+# Reset directories using fast Linux commands
 if os.path.exists(base_output_dir):
-    shutil.rmtree(base_output_dir)
+    subprocess.run(["rm", "-rf", base_output_dir])
 os.makedirs(base_output_dir, exist_ok=True)
 
 if os.path.exists(labels_dir):
-    shutil.rmtree(labels_dir)
+    subprocess.run(["rm", "-rf", labels_dir])
 os.makedirs(labels_dir, exist_ok=True)
 
 # Restored original frame skip as requested
@@ -182,16 +182,12 @@ for video_filename in video_files:
         target_folder = os.path.join(labels_dir, date_str, cam_str, time_str, folder_name)
         os.makedirs(target_folder, exist_ok=True)
         
-        shutil.move(img_path, target_folder)
+        # Replaced slow shutil.move with rapid Linux mv
+        subprocess.run(["mv", img_path, target_folder])
 
-    # Clean out the temp directory so the next video starts fresh
-    for filename in os.listdir(base_output_dir):
-        file_path = os.path.join(base_output_dir, filename)
-        try:
-            if os.path.isfile(file_path):
-                os.unlink(file_path)
-        except Exception as e:
-            pass
+    # Instantly nuke the temporary directory using Linux rm -rf instead of looping os.unlink
+    subprocess.run(["rm", "-rf", base_output_dir])
+    os.makedirs(base_output_dir, exist_ok=True)
 
 print("\n==================================================")
 print("ALL VIDEOS PROCESSED SUCCESSFULLY!")
