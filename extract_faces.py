@@ -42,10 +42,11 @@ transform = transforms.Compose([
     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
-# Directories
-videos_dir = './VIDEOS/' 
-base_output_dir = './extracted_faces_temp' 
-labels_dir = './LABELS' 
+# Directories - Hardcoded to point to the specific folder
+target_dir = './Extraceted Data'
+videos_dir = f'{target_dir}/VIDEOS/' 
+base_output_dir = f'{target_dir}/extracted_faces_temp' 
+labels_dir = f'{target_dir}/LABELS' 
 
 # Reset directories
 if os.path.exists(base_output_dir):
@@ -177,7 +178,7 @@ for video_filename in video_files:
             
         folder_name = f"Student_{label}"
         
-        # New Output Structure: LABELS/date/cam/time/Student_X/
+        # New Output Structure: target_dir/LABELS/date/cam/time/Student_X/
         target_folder = os.path.join(labels_dir, date_str, cam_str, time_str, folder_name)
         os.makedirs(target_folder, exist_ok=True)
         
