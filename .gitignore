@@ -1,8 +1,7 @@
 VIDEOS/
-Extraceted Data/extracted_faces
-Extraceted Data/videos
+Extraceted Data/
 BALANCED_LABELS/
-LABELS/
+LABELSsss/
 ATTENDENCE RESULTS/
 Clusters and Similarity/
 Results/
@@ -17,5 +16,6 @@ Results/
 *.engine
 *.mp4
 *.mkv
+*.npy
 .vscode
 *.yaml
