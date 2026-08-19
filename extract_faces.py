@@ -1,5 +1,6 @@
 import cv2
 import os
+import glob
 import torch
 import numpy as np
 import hdbscan
@@ -11,7 +12,39 @@ from facenet_pytorch import InceptionResnetV1
 from torchvision import transforms
 
 # ==========================================
-# CROP HELPER FUNCTION
+# CONFIGURATION & SETUP
+# ==========================================
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(f"Running on device: {device}")
+
+# Directories
+TARGET_DIR = './Extracted_Data'
+VIDEOS_DIR = os.path.join(TARGET_DIR, 'VIDEOS')
+TEMP_FACES_DIR = os.path.join(TARGET_DIR, 'temp_faces')
+EMBEDDINGS_DIR = os.path.join(TARGET_DIR, 'embeddings_cache')
+GLOBAL_LABELS_DIR = os.path.join(TARGET_DIR, 'GLOBAL_LABELS')
+
+# Create necessary directories (Safe creation)
+for d in [VIDEOS_DIR, TEMP_FACES_DIR, EMBEDDINGS_DIR, GLOBAL_LABELS_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+# Processing parameters
+FRAME_SKIP = 10 
+BATCH_SIZE = 128
+CONF_THRESHOLD = 0.65
+MIN_FACE_SIZE = 45
+
+# Load Models
+yolo_model = YOLO('yolov8n-face.pt', task='detect')
+resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+
+# ==========================================
+# HELPER FUNCTIONS
 # ==========================================
 def crop_with_margin(img, box, margin_percentage=0.15):
     x1, y1, x2, y2 = map(int, box)
@@ -28,140 +61,117 @@ def crop_with_margin(img, box, margin_percentage=0.15):
     return img[fy1:fy2, fx1:fx2]
 
 # ==========================================
-# 1. SETUP
+# PHASE 1: VIDEO EXTRACTION & EMBEDDING
 # ==========================================
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-print(f"Running on device: {device}")
-
-# Load Models
-yolo_model = YOLO('yolov8n-face.pt', task='detect')
-resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-])
-
-# Directories - Hardcoded to point to the specific folder
-target_dir = './Extraceted Data'
-videos_dir = f'{target_dir}/VIDEOS/' 
-base_output_dir = f'{target_dir}/extracted_faces_temp' 
-labels_dir = f'{target_dir}/LABELS' 
-
-# Reset ONLY the temporary extraction directory using native Python
-if os.path.exists(base_output_dir):
-    shutil.rmtree(base_output_dir)
-os.makedirs(base_output_dir, exist_ok=True)
-
-# Ensure LABELS exists, but DO NOT delete it so history is preserved
-os.makedirs(labels_dir, exist_ok=True)
-
-# Processing parameters
-frame_skip = 10 
-batch_size = 128
-
-# ==========================================
-# 2. PROCESS VIDEO BY VIDEO
-# ==========================================
-video_files = [f for f in os.listdir(videos_dir) if f.endswith(('.mp4', '.avi', '.mov', '.mkv'))]
-
-for video_filename in video_files:
-    print(f"\n{'='*50}\nProcessing Video: {video_filename}\n{'='*50}")
+def process_videos():
+    video_files = [f for f in os.listdir(VIDEOS_DIR) if f.endswith(('.mp4', '.avi', '.mov', '.mkv'))]
     
-    # Parse filename: 20260807_110016_cam1_raw.mp4
-    parts = video_filename.split('_')
-    if len(parts) >= 3:
-        date_str = parts[0]   
-        time_str = parts[1]   
-        cam_str = parts[2]    
-    else:
-        date_str, time_str, cam_str = "unknown", "unknown", "unknown"
-
-    # --- DYNAMIC SKIP CHECK ---
-    expected_output_dir = os.path.join(labels_dir, date_str, cam_str, time_str)
-    
-    if os.path.exists(expected_output_dir):
-        print(f"-> Skipping: {video_filename}. Clustering already exists at {expected_output_dir}")
-        continue
-    # --------------------------
-
-    video_path = os.path.join(videos_dir, video_filename)
-    cap = cv2.VideoCapture(video_path)
-    frame_count = 0
-    saved_faces_this_video = 0
-    image_metadata = [] 
-    
-    print("-> Extracting faces...")
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-            
-        frame_count += 1
+    for video_filename in video_files:
+        video_id = os.path.splitext(video_filename)[0]
+        embedding_file = os.path.join(EMBEDDINGS_DIR, f"{video_id}.npz")
         
-        if frame_count % frame_skip == 0:
-            results = yolo_model(frame, verbose=False)
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-            confs = results[0].boxes.conf.cpu().numpy()
+        # DYNAMIC SKIP: If we already extracted embeddings for this video, skip Phase 1
+        if os.path.exists(embedding_file):
+            print(f"-> Skipping Extraction: {video_filename} (Embeddings cached)")
+            continue
             
-            for face_idx, (box, conf) in enumerate(zip(boxes, confs)):
-                if conf < 0.65:
-                    continue
-                
-                x1, y1, x2, y2 = map(int, box)
-                if (x2 - x1) < 45 or (y2 - y1) < 45:
-                    continue
+        print(f"\n{'='*50}\nPhase 1: Extracting from {video_filename}\n{'='*50}")
+        
+        # Parse filename dynamically (Fallback if format doesn't match)
+        parts = video_id.split('_')
+        date_str = parts[0] if len(parts) > 0 else "unknown"
+        time_str = parts[1] if len(parts) > 1 else "unknown"
+        cam_str = parts[2] if len(parts) > 2 else "unknown"
 
-                face_crop_bgr = crop_with_margin(frame, box, margin_percentage=0.15)
+        video_path = os.path.join(VIDEOS_DIR, video_filename)
+        cap = cv2.VideoCapture(video_path)
+        
+        frame_count = 0
+        image_metadata = [] 
+        
+        # --- 1A. FACE DETECTION ---
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
                 
-                if face_crop_bgr.size > 0:
-                    final_face_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
+            frame_count += 1
+            if frame_count % FRAME_SKIP == 0:
+                results = yolo_model(frame, verbose=False)
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                confs = results[0].boxes.conf.cpu().numpy()
+                
+                for face_idx, (box, conf) in enumerate(zip(boxes, confs)):
+                    if conf < CONF_THRESHOLD: continue
                     
-                    filename = f"frame_{frame_count}_face_{face_idx}.jpg"
-                    save_path = os.path.join(base_output_dir, filename)
-                    
-                    try:
+                    x1, y1, x2, y2 = map(int, box)
+                    if (x2 - x1) < MIN_FACE_SIZE or (y2 - y1) < MIN_FACE_SIZE: continue
+
+                    face_crop_bgr = crop_with_margin(frame, box, margin_percentage=0.15)
+                    if face_crop_bgr.size > 0:
+                        final_face_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
+                        
+                        # Generate a highly unique filename to prevent overwriting
+                        filename = f"{date_str}_{time_str}_{cam_str}_f{frame_count}_i{face_idx}.jpg"
+                        save_path = os.path.join(TEMP_FACES_DIR, filename)
+                        
                         cv2.imwrite(save_path, final_face_160)
                         image_metadata.append(save_path)
-                        saved_faces_this_video += 1
-                    except Exception as e:
-                        print(f"   Error saving frame {frame_count}: {e}")
 
-    cap.release()
-    print(f"   Extracted {saved_faces_this_video} faces.")
+        cap.release()
+        
+        if not image_metadata:
+            print(f"   No faces found in {video_filename}.")
+            continue
 
-    if saved_faces_this_video == 0:
-        continue
-
-    # ------------------------------------------
-    # GENERATE EMBEDDINGS (For this video only)
-    # ------------------------------------------
-    print("-> Generating embeddings...")
-    embeddings = []
-    
-    with torch.no_grad():
-        for i in range(0, len(image_metadata), batch_size):
-            batch_paths = image_metadata[i:i+batch_size]
-            batch_tensors = []
-            
-            for img_path in batch_paths:
-                img = Image.open(img_path).convert('RGB')
-                batch_tensors.append(transform(img))
+        # --- 1B. GENERATE EMBEDDINGS ---
+        print(f"   Generating embeddings for {len(image_metadata)} faces...")
+        embeddings = []
+        
+        with torch.no_grad():
+            for i in range(0, len(image_metadata), BATCH_SIZE):
+                batch_paths = image_metadata[i:i+BATCH_SIZE]
+                batch_tensors = []
                 
-            batch_tensor = torch.stack(batch_tensors).to(device)
-            
-            emb_batch = resnet(batch_tensor)
-            emb_batch = F.normalize(emb_batch, p=2, dim=1).cpu().numpy()
-            
-            embeddings.extend(emb_batch)
+                for img_path in batch_paths:
+                    img = Image.open(img_path).convert('RGB')
+                    batch_tensors.append(transform(img))
+                    
+                batch_tensor = torch.stack(batch_tensors).to(device)
+                emb_batch = resnet(batch_tensor)
+                emb_batch = F.normalize(emb_batch, p=2, dim=1).cpu().numpy()
+                embeddings.extend(emb_batch)
 
-    embeddings = np.array(embeddings)
+        # Save to cache so we never have to run ResNet on this video again
+        np.savez_compressed(embedding_file, paths=image_metadata, embeddings=np.array(embeddings))
+        print(f"   Saved {len(embeddings)} embeddings to cache.")
 
-    # ------------------------------------------
-    # CLUSTER AND MOVE FILES (For this video only)
-    # ------------------------------------------
-    print("-> Running HDBSCAN Clustering...")
+# ==========================================
+# PHASE 2: GLOBAL CLUSTERING
+# ==========================================
+def global_clustering():
+    print(f"\n{'='*50}\nPhase 2: Global Identity Grouping\n{'='*50}")
     
+    npz_files = glob.glob(os.path.join(EMBEDDINGS_DIR, "*.npz"))
+    if not npz_files:
+        print("No embedding caches found. Run Phase 1 first.")
+        return
+
+    all_embeddings = []
+    all_paths = []
+
+    # Load all cached embeddings globally
+    for npz_file in npz_files:
+        data = np.load(npz_file)
+        all_paths.extend(data['paths'])
+        all_embeddings.extend(data['embeddings'])
+
+    all_embeddings = np.array(all_embeddings)
+    all_paths = np.array(all_paths)
+    
+    print(f"-> Clustering {len(all_embeddings)} total faces across all videos/cameras...")
+
+    # Run HDBSCAN on the massive global dataset
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=50,            
         min_samples=15,                 
@@ -170,31 +180,38 @@ for video_filename in video_files:
         cluster_selection_method='eom'
     )
     
-    labels = clusterer.fit_predict(embeddings)
+    labels = clusterer.fit_predict(all_embeddings)
     unique_labels = set(labels)
     num_clusters = len(unique_labels) - (1 if -1 in labels else 0)
     
-    print(f"   Found {num_clusters} student clusters.")
+    print(f"-> Identified {num_clusters} unique global students.")
+    
+    # Clear the old global structure to avoid duplicate data mixing
+    if os.path.exists(GLOBAL_LABELS_DIR):
+        shutil.rmtree(GLOBAL_LABELS_DIR)
+    os.makedirs(GLOBAL_LABELS_DIR, exist_ok=True)
 
-    print("-> Moving images to structured folders...")
-    for img_path, label in zip(image_metadata, labels):
-        if label == -1:
-            continue
+    # Move files to Global Identity Folders
+    print("-> Moving images to Global Identity folders...")
+    for img_path, label in zip(all_paths, labels):
+        if label == -1: continue # Noise
             
-        folder_name = f"Student_{label}"
-        target_folder = os.path.join(labels_dir, date_str, cam_str, time_str, folder_name)
-        os.makedirs(target_folder, exist_ok=True)
+        student_folder = os.path.join(GLOBAL_LABELS_DIR, f"Global_Student_{label}")
+        os.makedirs(student_folder, exist_ok=True)
         
-        # Native Python file move (much faster on network drives)
-        destination_file = os.path.join(target_folder, os.path.basename(img_path))
-        shutil.move(img_path, destination_file)
+        # Because we used a unique naming format (date_time_cam_frame.jpg)
+        # we can just copy them into the global student folder.
+        dest_path = os.path.join(student_folder, os.path.basename(img_path))
+        
+        if os.path.exists(img_path):
+            shutil.copy(img_path, dest_path)
 
-    # Instantly clear the temporary directory for the next video using native Python
-    if os.path.exists(base_output_dir):
-        shutil.rmtree(base_output_dir)
-    os.makedirs(base_output_dir, exist_ok=True)
+    print("\nGlobal processing complete!")
+    print(f"Grouped data saved in: {os.path.abspath(GLOBAL_LABELS_DIR)}")
 
-print("\n==================================================")
-print("ALL VIDEOS PROCESSED SUCCESSFULLY!")
-print(f"Data saved in: {os.path.abspath(labels_dir)}")
-print("==================================================")
+# ==========================================
+# EXECUTION
+# ==========================================
+if __name__ == "__main__":
+    process_videos()     # Extracts and caches embeddings dynamically
+    global_clustering()  # Clusters everything into global identities
