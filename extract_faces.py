@@ -48,13 +48,12 @@ videos_dir = f'{target_dir}/VIDEOS/'
 base_output_dir = f'{target_dir}/extracted_faces_temp' 
 labels_dir = f'{target_dir}/LABELS' 
 
-# Reset directories using fast Linux commands
+# Reset ONLY the temporary extraction directory
 if os.path.exists(base_output_dir):
     subprocess.run(["rm", "-rf", base_output_dir])
 os.makedirs(base_output_dir, exist_ok=True)
 
-if os.path.exists(labels_dir):
-    subprocess.run(["rm", "-rf", labels_dir])
+# Ensure LABELS exists, but DO NOT delete it so history is preserved
 os.makedirs(labels_dir, exist_ok=True)
 
 # Restored original frame skip as requested
@@ -77,6 +76,16 @@ for video_filename in video_files:
         cam_str = parts[2]    # 'cam1'
     else:
         date_str, time_str, cam_str = "unknown", "unknown", "unknown"
+
+    # --- NEW DYNAMIC SKIP CHECK ---
+    # Construct the final expected output path for this specific video
+    expected_output_dir = os.path.join(labels_dir, date_str, cam_str, time_str)
+    
+    # If the folder exists, it means we already extracted and clustered this video
+    if os.path.exists(expected_output_dir):
+        print(f"-> Skipping: {video_filename}. Clustering already exists at {expected_output_dir}")
+        continue
+    # ------------------------------
 
     video_path = os.path.join(videos_dir, video_filename)
     cap = cv2.VideoCapture(video_path)
@@ -158,7 +167,7 @@ for video_filename in video_files:
     
     # Tuned for a single video with frame_skip=10
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=50,            # High because frame_skip=10 captures the same student many times
+        min_cluster_size=50,            
         min_samples=15,                 
         metric='euclidean', 
         cluster_selection_epsilon=0.45, 
