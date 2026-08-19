@@ -18,7 +18,7 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(f"Running on device: {device}")
 
 # Directories
-TARGET_DIR = './Extracted_Data'
+TARGET_DIR = './Extracted Data'
 VIDEOS_DIR = os.path.join(TARGET_DIR, 'VIDEOS')
 TEMP_FACES_DIR = os.path.join(TARGET_DIR, 'temp_faces')
 EMBEDDINGS_DIR = os.path.join(TARGET_DIR, 'embeddings_cache')
