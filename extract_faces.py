@@ -2,8 +2,8 @@ import cv2
 import os
 import torch
 import numpy as np
-import subprocess
 import hdbscan
+import shutil
 import torch.nn.functional as F
 from ultralytics import YOLO
 from PIL import Image
@@ -48,15 +48,15 @@ videos_dir = f'{target_dir}/VIDEOS/'
 base_output_dir = f'{target_dir}/extracted_faces_temp' 
 labels_dir = f'{target_dir}/LABELS' 
 
-# Reset ONLY the temporary extraction directory
+# Reset ONLY the temporary extraction directory using native Python
 if os.path.exists(base_output_dir):
-    subprocess.run(["rm", "-rf", base_output_dir])
+    shutil.rmtree(base_output_dir)
 os.makedirs(base_output_dir, exist_ok=True)
 
 # Ensure LABELS exists, but DO NOT delete it so history is preserved
 os.makedirs(labels_dir, exist_ok=True)
 
-# Restored original frame skip as requested
+# Processing parameters
 frame_skip = 10 
 batch_size = 128
 
@@ -71,27 +71,25 @@ for video_filename in video_files:
     # Parse filename: 20260807_110016_cam1_raw.mp4
     parts = video_filename.split('_')
     if len(parts) >= 3:
-        date_str = parts[0]   # '20260807'
-        time_str = parts[1]   # '110016'
-        cam_str = parts[2]    # 'cam1'
+        date_str = parts[0]   
+        time_str = parts[1]   
+        cam_str = parts[2]    
     else:
         date_str, time_str, cam_str = "unknown", "unknown", "unknown"
 
-    # --- NEW DYNAMIC SKIP CHECK ---
-    # Construct the final expected output path for this specific video
+    # --- DYNAMIC SKIP CHECK ---
     expected_output_dir = os.path.join(labels_dir, date_str, cam_str, time_str)
     
-    # If the folder exists, it means we already extracted and clustered this video
     if os.path.exists(expected_output_dir):
         print(f"-> Skipping: {video_filename}. Clustering already exists at {expected_output_dir}")
         continue
-    # ------------------------------
+    # --------------------------
 
     video_path = os.path.join(videos_dir, video_filename)
     cap = cv2.VideoCapture(video_path)
     frame_count = 0
     saved_faces_this_video = 0
-    image_metadata = [] # Resets for each video
+    image_metadata = [] 
     
     print("-> Extracting faces...")
     while cap.isOpened():
@@ -132,7 +130,6 @@ for video_filename in video_files:
     cap.release()
     print(f"   Extracted {saved_faces_this_video} faces.")
 
-    # Skip to next video if no faces found
     if saved_faces_this_video == 0:
         continue
 
@@ -165,7 +162,6 @@ for video_filename in video_files:
     # ------------------------------------------
     print("-> Running HDBSCAN Clustering...")
     
-    # Tuned for a single video with frame_skip=10
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=50,            
         min_samples=15,                 
@@ -186,16 +182,16 @@ for video_filename in video_files:
             continue
             
         folder_name = f"Student_{label}"
-        
-        # New Output Structure: target_dir/LABELS/date/cam/time/Student_X/
         target_folder = os.path.join(labels_dir, date_str, cam_str, time_str, folder_name)
         os.makedirs(target_folder, exist_ok=True)
         
-        # Replaced slow shutil.move with rapid Linux mv
-        subprocess.run(["mv", img_path, target_folder])
+        # Native Python file move (much faster on network drives)
+        destination_file = os.path.join(target_folder, os.path.basename(img_path))
+        shutil.move(img_path, destination_file)
 
-    # Instantly nuke the temporary directory using Linux rm -rf instead of looping os.unlink
-    subprocess.run(["rm", "-rf", base_output_dir])
+    # Instantly clear the temporary directory for the next video using native Python
+    if os.path.exists(base_output_dir):
+        shutil.rmtree(base_output_dir)
     os.makedirs(base_output_dir, exist_ok=True)
 
 print("\n==================================================")
