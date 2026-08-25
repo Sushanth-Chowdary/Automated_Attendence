@@ -196,7 +196,7 @@ def global_clustering():
     
     # SIMILARITY_THRESHOLD: Tweaking parameter. 
     # 0.25 is a strict cutoff to drop virtually identical frames.
-    SIMILARITY_THRESHOLD = 0.25 
+    SIMILARITY_THRESHOLD = 0.10 
     
     saved_student_embeddings = {}
     saved_counts = {}
