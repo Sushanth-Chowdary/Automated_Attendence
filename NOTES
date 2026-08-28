@@ -1,3 +1,51 @@
+remove the bottleneck in the gui 
+cpu threshold is still there (slower)
+move open cv to group (faster)
+Optimize the Laplacian Blur Filter (fater)
+there are ,ore people in the frame (slower)
+faiss query on the gpu
+
+
+
+group is better clusteriing 
+the network drive cant accept the 500k samples a lot of requests which the network drive slower
+more storage in local computer is better 
+
+
+
+
+
+
+
+
+labels 289k samples
+20-25fps
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 2026-04-07_09.18.02.mkv  _ medium 24
 
 video2.mkv _ medium
