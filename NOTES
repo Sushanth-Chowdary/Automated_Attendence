@@ -24,18 +24,29 @@ labels 289k samples
 
 
 
+zoom in and out 
+delay out the gui in live tracking 
+half deprecated
+patching adding fake frames to make it look seamless 
 
 
 
 
 
+some it became worse after seding everthing to the gpu
+revert to the old code and start the gpu optimizations again from the start 
 
 
 
+clean the clusterring 
+fix the clustering code for better results 
+run after moving to the local computer using the npz files to skip the phase 1
 
 
+move the top 2 users as quick as possible
 
 
+jahanvi - anaconda file 
 
 
 
