@@ -171,12 +171,12 @@ def global_clustering():
     
     print(f"-> Clustering {len(all_embeddings)} total faces across all videos/cameras...")
 
-    # Run HDBSCAN on the massive global dataset
+    # Updated HDBSCAN parameters for ~60 people in a 500k dataset
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=50,            
-        min_samples=15,                 
+        min_cluster_size=400,           
+        min_samples=40,                 
         metric='euclidean', 
-        cluster_selection_epsilon=0.45, 
+        cluster_selection_epsilon=0.35, 
         cluster_selection_method='eom'
     )
     
@@ -186,65 +186,37 @@ def global_clustering():
     
     print(f"-> Identified {num_clusters} unique global students.")
     
-    # Clear the old global structure to avoid duplicate data mixing
+    # Clear the old global structure
     if os.path.exists(GLOBAL_LABELS_DIR):
         shutil.rmtree(GLOBAL_LABELS_DIR)
     os.makedirs(GLOBAL_LABELS_DIR, exist_ok=True)
 
-    # Move files to Global Identity Folders (Smart Similarity Filtering)
-    print("-> Moving images to Global Identity folders (Filtering out near-identical poses)...")
+    print("-> Creating directories and transferring all images...")
     
-    # SIMILARITY_THRESHOLD: Tweaking parameter. 
-    # 0.25 is a strict cutoff to drop virtually identical frames.
-    SIMILARITY_THRESHOLD = 0.10 
-    
-    saved_student_embeddings = {}
-    saved_counts = {}
-    skipped_duplicates = 0
+    # Pre-create all folders to save I/O time during the loop
+    for label in unique_labels:
+        if label != -1:
+            os.makedirs(os.path.join(GLOBAL_LABELS_DIR, f"Global_Student_{label}"), exist_ok=True)
 
-    for img_path, label, current_emb in zip(all_paths, labels, all_embeddings):
-        if label == -1: continue # Noise
+    moved_count = 0
+
+    # Fast loop: No distance calculations, just straight copying
+    for img_path, label in zip(all_paths, labels):
+        if label == -1: continue # Skip HDBSCAN noise
             
-        if label not in saved_student_embeddings:
-            saved_student_embeddings[label] = []
-            saved_counts[label] = 0
-            
-        is_unique_pose = True
+        dest_path = os.path.join(GLOBAL_LABELS_DIR, f"Global_Student_{label}", os.path.basename(img_path))
         
-        if len(saved_student_embeddings[label]) > 0:
-            past_embs = np.array(saved_student_embeddings[label])
-            
-            # Calculate the Euclidean distance
-            distances = np.linalg.norm(past_embs - current_emb, axis=1)
-            min_distance = np.min(distances)
-            
-            # If closest matching saved photo is extremely similar, mark it as a duplicate
-            if min_distance < SIMILARITY_THRESHOLD:
-                is_unique_pose = False
-                
-        # If it is a new/unique pose, save it to the network drive
-        if is_unique_pose:
-            student_folder = os.path.join(GLOBAL_LABELS_DIR, f"Global_Student_{label}")
-            os.makedirs(student_folder, exist_ok=True)
-            
-            dest_path = os.path.join(student_folder, os.path.basename(img_path))
-            
-            if os.path.exists(img_path):
-                # Safely copy file data without SMB metadata crashing
-                shutil.copyfile(img_path, dest_path)
-                
-                saved_student_embeddings[label].append(current_emb)
-                saved_counts[label] += 1
-        else:
-            skipped_duplicates += 1
+        if os.path.exists(img_path):
+            shutil.copyfile(img_path, dest_path) 
+            moved_count += 1
 
     print(f"\nGlobal processing complete!")
-    print(f"Skipped {skipped_duplicates} highly similar duplicate frames.")
+    print(f"Successfully transferred {moved_count} frames without reduction.")
     print(f"Grouped data saved in: {os.path.abspath(GLOBAL_LABELS_DIR)}")
 
 # ==========================================
 # EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    process_videos()     # Extracts and caches embeddings dynamically
-    global_clustering()  # Clusters everything into global identities
+    process_videos()     
+    global_clustering()
