@@ -43,10 +43,7 @@ fix the clustering code for better results
 run after moving to the local computer using the npz files to skip the phase 1
 
 
-move the top 2 users as quick as possible
-
-
-jahanvi - anaconda file 
+update the camera presets for a better angle  
 
 
 
