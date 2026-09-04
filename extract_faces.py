@@ -3,13 +3,24 @@ import os
 import glob
 import torch
 import numpy as np
-import hdbscan
 import shutil
 import torch.nn.functional as F
 from ultralytics import YOLO
 from PIL import Image
 from facenet_pytorch import InceptionResnetV1
 from torchvision import transforms
+
+# ==========================================
+# GPU CLUSTERING & MULTI-CORE CPU FALLBACK
+# ==========================================
+try:
+    from cuml.cluster import HDBSCAN
+    print("Using GPU-accelerated cuML HDBSCAN")
+    USE_CUML = True
+except ImportError:
+    import hdbscan
+    print("cuML not found. Falling back to multi-core CPU HDBSCAN")
+    USE_CUML = False
 
 # ==========================================
 # CONFIGURATION & SETUP
@@ -31,6 +42,7 @@ for d in [VIDEOS_DIR, TEMP_FACES_DIR, EMBEDDINGS_DIR, GLOBAL_LABELS_DIR]:
 # Processing parameters
 FRAME_SKIP = 10 
 BATCH_SIZE = 128
+YOLO_BATCH_SIZE = 32  # Added YOLO Batch Inference Size
 CONF_THRESHOLD = 0.65
 MIN_FACE_SIZE = 45
 
@@ -89,7 +101,10 @@ def process_videos():
         frame_count = 0
         image_metadata = [] 
         
-        # --- 1A. FACE DETECTION ---
+        batch_frames = []
+        batch_frame_counts = []
+        
+        # --- 1A. FACE DETECTION (Batched YOLO Inference) ---
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -97,9 +112,46 @@ def process_videos():
                 
             frame_count += 1
             if frame_count % FRAME_SKIP == 0:
-                results = yolo_model(frame, verbose=False)
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                confs = results[0].boxes.conf.cpu().numpy()
+                batch_frames.append(frame)
+                batch_frame_counts.append(frame_count)
+                
+                if len(batch_frames) >= YOLO_BATCH_SIZE:
+                    results = yolo_model(batch_frames, verbose=False)
+                    
+                    for batch_idx, result in enumerate(results):
+                        boxes = result.boxes.xyxy.cpu().numpy()
+                        confs = result.boxes.conf.cpu().numpy()
+                        curr_frame = batch_frames[batch_idx]
+                        curr_frame_count = batch_frame_counts[batch_idx]
+                        
+                        for face_idx, (box, conf) in enumerate(zip(boxes, confs)):
+                            if conf < CONF_THRESHOLD: continue
+                            
+                            x1, y1, x2, y2 = map(int, box)
+                            if (x2 - x1) < MIN_FACE_SIZE or (y2 - y1) < MIN_FACE_SIZE: continue
+
+                            face_crop_bgr = crop_with_margin(curr_frame, box, margin_percentage=0.15)
+                            if face_crop_bgr.size > 0:
+                                final_face_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
+                                
+                                filename = f"{date_str}_{time_str}_{cam_str}_f{curr_frame_count}_i{face_idx}.jpg"
+                                save_path = os.path.join(TEMP_FACES_DIR, filename)
+                                
+                                cv2.imwrite(save_path, final_face_160)
+                                image_metadata.append(save_path)
+                                
+                    batch_frames = []
+                    batch_frame_counts = []
+
+        # Process any remaining frames in the batch
+        if batch_frames:
+            results = yolo_model(batch_frames, verbose=False)
+            
+            for batch_idx, result in enumerate(results):
+                boxes = result.boxes.xyxy.cpu().numpy()
+                confs = result.boxes.conf.cpu().numpy()
+                curr_frame = batch_frames[batch_idx]
+                curr_frame_count = batch_frame_counts[batch_idx]
                 
                 for face_idx, (box, conf) in enumerate(zip(boxes, confs)):
                     if conf < CONF_THRESHOLD: continue
@@ -107,12 +159,11 @@ def process_videos():
                     x1, y1, x2, y2 = map(int, box)
                     if (x2 - x1) < MIN_FACE_SIZE or (y2 - y1) < MIN_FACE_SIZE: continue
 
-                    face_crop_bgr = crop_with_margin(frame, box, margin_percentage=0.15)
+                    face_crop_bgr = crop_with_margin(curr_frame, box, margin_percentage=0.15)
                     if face_crop_bgr.size > 0:
                         final_face_160 = cv2.resize(face_crop_bgr, (160, 160), interpolation=cv2.INTER_CUBIC)
                         
-                        # Generate a highly unique filename to prevent overwriting
-                        filename = f"{date_str}_{time_str}_{cam_str}_f{frame_count}_i{face_idx}.jpg"
+                        filename = f"{date_str}_{time_str}_{cam_str}_f{curr_frame_count}_i{face_idx}.jpg"
                         save_path = os.path.join(TEMP_FACES_DIR, filename)
                         
                         cv2.imwrite(save_path, final_face_160)
@@ -166,21 +217,39 @@ def global_clustering():
         all_paths.extend(data['paths'])
         all_embeddings.extend(data['embeddings'])
 
-    all_embeddings = np.array(all_embeddings)
+    # 1. FORCE FLOAT32 TO HALVE MEMORY USAGE
+    all_embeddings = np.array(all_embeddings, dtype=np.float32)
     all_paths = np.array(all_paths)
     
-    print(f"-> Clustering {len(all_embeddings)} total faces across all videos/cameras...")
+    print(f"-> Loaded {len(all_embeddings)} total faces across all videos/cameras...")
 
-    # Updated HDBSCAN parameters for ~60 people in a 500k dataset
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=400,           
-        min_samples=40,                 
-        metric='euclidean', 
-        cluster_selection_epsilon=0.35, 
-        cluster_selection_method='eom'
-    )
+    # GPU clustering with cuML, or fallback to CPU multi-core
+    if USE_CUML:
+        print("-> Fitting HDBSCAN on entire dataset using batched memory partitioning...")
+        
+        # cuML memory partitioning parameters must be passed via the build_kwds dictionary
+        clusterer = HDBSCAN(
+            min_cluster_size=400,           
+            min_samples=40,                 
+            metric='euclidean', 
+            cluster_selection_epsilon=0.35, 
+            cluster_selection_method='eom',
+            build_kwds={'knn_n_clusters': 8, 'knn_overlap_factor': 3}
+        )
+        labels = clusterer.fit_predict(all_embeddings)
+            
+    else:
+        print("-> Clustering (CPU Multi-core)...")
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=400,           
+            min_samples=40,                 
+            metric='euclidean', 
+            cluster_selection_epsilon=0.35, 
+            cluster_selection_method='eom',
+            core_dist_n_jobs=-1
+        )
+        labels = clusterer.fit_predict(all_embeddings)
     
-    labels = clusterer.fit_predict(all_embeddings)
     unique_labels = set(labels)
     num_clusters = len(unique_labels) - (1 if -1 in labels else 0)
     

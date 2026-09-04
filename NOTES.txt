@@ -1,11 +1,15 @@
 remove the bottleneck in the gui 
 cpu threshold is still there (slower)
-move open cv to group (faster)
+move open cv to group gpu  (faster)
 Optimize the Laplacian Blur Filter (fater)
 there are ,ore people in the frame (slower)
 faiss query on the gpu
 
 
+Pure GPU Cropping and Resizing (Eliminate OpenCV)
+Zero-Copy IPC (Shared Memory)
+Remove CPU Synchronization Locks :Batch CPU Transfers,Vectorize the FAISS Query
+Optimize the Laplacian Blur Filter
 
 group is better clusteriing 
 the network drive cant accept the 500k samples a lot of requests which the network drive slower
@@ -17,8 +21,6 @@ more storage in local computer is better
 
 
 
-
-labels 289k samples
 20-25fps
 
 
@@ -33,8 +35,8 @@ patching adding fake frames to make it look seamless
 
 
 
-some it became worse after seding everthing to the gpu
-revert to the old code and start the gpu optimizations again from the start 
+
+start the gpu optimizations again from the start 
 
 
 
