@@ -225,16 +225,14 @@ def global_clustering():
 
     # GPU clustering with cuML, or fallback to CPU multi-core
     if USE_CUML:
-        print("-> Fitting HDBSCAN on entire dataset using batched memory partitioning...")
+        print("-> Fitting HDBSCAN on entire dataset directly on GPU...")
         
-        # cuML memory partitioning parameters must be passed via the build_kwds dictionary
         clusterer = HDBSCAN(
             min_cluster_size=400,           
             min_samples=40,                 
             metric='euclidean', 
             cluster_selection_epsilon=0.35, 
-            cluster_selection_method='eom',
-            build_kwds={'knn_n_clusters': 8, 'knn_overlap_factor': 3}
+            cluster_selection_method='eom'
         )
         labels = clusterer.fit_predict(all_embeddings)
             
