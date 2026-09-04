@@ -9,18 +9,14 @@ from ultralytics import YOLO
 from PIL import Image
 from facenet_pytorch import InceptionResnetV1
 from torchvision import transforms
+import hdbscan
 
 # ==========================================
-# GPU CLUSTERING & MULTI-CORE CPU FALLBACK
+# CLUSTERING ENGINE SELECTION
 # ==========================================
-try:
-    from cuml.cluster import HDBSCAN
-    print("Using GPU-accelerated cuML HDBSCAN")
-    USE_CUML = True
-except ImportError:
-    import hdbscan
-    print("cuML not found. Falling back to multi-core CPU HDBSCAN")
-    USE_CUML = False
+# Force CPU HDBSCAN to prevent GPU VRAM/driver segmentation faults on 500k+ samples
+USE_CUML = False
+print("Configured: Using Multi-Core CPU HDBSCAN for clustering.")
 
 # ==========================================
 # CONFIGURATION & SETUP
@@ -42,7 +38,7 @@ for d in [VIDEOS_DIR, TEMP_FACES_DIR, EMBEDDINGS_DIR, GLOBAL_LABELS_DIR]:
 # Processing parameters
 FRAME_SKIP = 10 
 BATCH_SIZE = 128
-YOLO_BATCH_SIZE = 32  # Added YOLO Batch Inference Size
+YOLO_BATCH_SIZE = 32
 CONF_THRESHOLD = 0.65
 MIN_FACE_SIZE = 45
 
@@ -217,36 +213,23 @@ def global_clustering():
         all_paths.extend(data['paths'])
         all_embeddings.extend(data['embeddings'])
 
-    # 1. FORCE FLOAT32 TO HALVE MEMORY USAGE
+    # Force float32 to reduce memory overhead
     all_embeddings = np.array(all_embeddings, dtype=np.float32)
     all_paths = np.array(all_paths)
     
     print(f"-> Loaded {len(all_embeddings)} total faces across all videos/cameras...")
 
-    # GPU clustering with cuML, or fallback to CPU multi-core
-    if USE_CUML:
-        print("-> Fitting HDBSCAN on entire dataset directly on GPU...")
-        
-        clusterer = HDBSCAN(
-            min_cluster_size=400,           
-            min_samples=40,                 
-            metric='euclidean', 
-            cluster_selection_epsilon=0.35, 
-            cluster_selection_method='eom'
-        )
-        labels = clusterer.fit_predict(all_embeddings)
-            
-    else:
-        print("-> Clustering (CPU Multi-core)...")
-        clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=400,           
-            min_samples=40,                 
-            metric='euclidean', 
-            cluster_selection_epsilon=0.35, 
-            cluster_selection_method='eom',
-            core_dist_n_jobs=-1
-        )
-        labels = clusterer.fit_predict(all_embeddings)
+    # CPU Multi-Core clustering using all available cores
+    print("-> Fitting HDBSCAN on entire dataset using all CPU cores...")
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=400,           
+        min_samples=40,                 
+        metric='euclidean', 
+        cluster_selection_epsilon=0.35, 
+        cluster_selection_method='eom',
+        core_dist_n_jobs=-1
+    )
+    labels = clusterer.fit_predict(all_embeddings)
     
     unique_labels = set(labels)
     num_clusters = len(unique_labels) - (1 if -1 in labels else 0)
@@ -267,9 +250,10 @@ def global_clustering():
 
     moved_count = 0
 
-    # Fast loop: No distance calculations, just straight copying
+    # Transfer categorized images to destination folders
     for img_path, label in zip(all_paths, labels):
-        if label == -1: continue # Skip HDBSCAN noise
+        if label == -1: 
+            continue  # Skip HDBSCAN noise
             
         dest_path = os.path.join(GLOBAL_LABELS_DIR, f"Global_Student_{label}", os.path.basename(img_path))
         
