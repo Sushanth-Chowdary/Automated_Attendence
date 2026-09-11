@@ -1,57 +1,25 @@
 remove the bottleneck in the gui 
 cpu threshold is still there (slower)
-move open cv to group gpu  (faster)
+move open cv to group (faster)
 Optimize the Laplacian Blur Filter (fater)
 there are ,ore people in the frame (slower)
 faiss query on the gpu
 
-
-Pure GPU Cropping and Resizing (Eliminate OpenCV)
-Zero-Copy IPC (Shared Memory)
-Remove CPU Synchronization Locks :Batch CPU Transfers,Vectorize the FAISS Query
-Optimize the Laplacian Blur Filter
-
-group is better clusteriing 
-the network drive cant accept the 500k samples a lot of requests which the network drive slower
-more storage in local computer is better 
-
-
-
-
-
-
-
+labels 500k samples
 20-25fps
-
-
-
 
 zoom in and out 
 delay out the gui in live tracking 
 half deprecated
 patching adding fake frames to make it look seamless 
 
-
-
-
-
-
 start the gpu optimizations again from the start 
-
-
 
 clean the clusterring 
 fix the clustering code for better results 
 run after moving to the local computer using the npz files to skip the phase 1
 
-
 update the camera presets for a better angle  
-
-
-
-
-
-
 
 
 
@@ -83,6 +51,3 @@ video1_uajX8qg0.mp4 _ medium
 2026-02-25_11.15.41.mkv _ samll
 
 2026-03-02_09.55.37.mkv _ small
-
-
-
