@@ -220,12 +220,12 @@ def global_clustering():
     print(f"-> Loaded {len(all_embeddings)} total faces across all videos/cameras...")
 
     # CPU Multi-Core clustering using all available cores
-    print("-> Fitting HDBSCAN with balanced parameters for ~60 students...")
+    print("-> Fitting HDBSCAN with tuned parameters for exact ~60 students...")
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=150,        
-        min_samples=15,           
+        min_cluster_size=250,           
+        min_samples=10,             
         metric='euclidean', 
-        cluster_selection_epsilon=0.40,  
+        cluster_selection_epsilon=0.44,
         cluster_selection_method='eom',
         core_dist_n_jobs=-1
     )

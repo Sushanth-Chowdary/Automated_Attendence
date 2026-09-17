@@ -1,25 +1,24 @@
-remove the bottleneck in the gui 
-cpu threshold is still there (slower)
-move open cv to group (faster)
-Optimize the Laplacian Blur Filter (fater)
-there are ,ore people in the frame (slower)
-faiss query on the gpu
 
-labels 500k samples
-20-25fps
-
-zoom in and out 
-delay out the gui in live tracking 
 half deprecated
 patching adding fake frames to make it look seamless 
 
-start the gpu optimizations again from the start 
-
 clean the clusterring 
-fix the clustering code for better results 
-run after moving to the local computer using the npz files to skip the phase 1
-
 update the camera presets for a better angle  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
