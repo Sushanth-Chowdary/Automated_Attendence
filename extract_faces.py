@@ -219,13 +219,13 @@ def global_clustering():
     
     print(f"-> Loaded {len(all_embeddings)} total faces across all videos/cameras...")
 
-    # CPU Multi-Core clustering using all available cores
-    print("-> Fitting HDBSCAN to purposely over-segment (shattering the super-cluster)...")
+    # CPU Multi-Core clustering
+    print("-> Fitting HDBSCAN at epsilon=0.35 with relaxed density thresholds...")
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=200,            
-        min_samples=15,                 
+        min_cluster_size=250,         
+        min_samples=20,                
         metric='euclidean', 
-        cluster_selection_epsilon=0.41,  
+        cluster_selection_epsilon=0.35,
         cluster_selection_method='eom',
         core_dist_n_jobs=-1
     )
