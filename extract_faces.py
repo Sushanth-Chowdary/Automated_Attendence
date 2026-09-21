@@ -14,7 +14,7 @@ import hdbscan
 # ==========================================
 # CLUSTERING ENGINE SELECTION
 # ==========================================
-# Force CPU HDBSCAN to prevent GPU VRAM/driver segmentation faults on 500k+ samples
+# Force CPU HDBSCAN to prevent GPU VRAM/driver segmentation faults on massive datasets
 USE_CUML = False
 print("Configured: Using Multi-Core CPU HDBSCAN for clustering.")
 

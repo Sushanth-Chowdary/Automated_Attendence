@@ -1,24 +1,12 @@
+update the testing code before the clustering happens using the gui code 
 
-half deprecated
-patching adding fake frames to make it look seamless 
+ready the videos of different protocols for the attendece prossecing(segment the usefull videos )
+
+update the process attendec and the tru attece sheet with the present data wioth all the dates
 
 clean the clusterring 
+
 update the camera presets for a better angle  
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
