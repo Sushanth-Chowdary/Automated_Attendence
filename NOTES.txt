@@ -1,14 +1,12 @@
-update the testing code before the clustering happens using the gui code 
-
 ready the videos of different protocols for the attendece prossecing(segment the usefull videos )
 
-update the process attendec and the tru attece sheet with the present data wioth all the dates
+update the process attendance
 
 clean the clusterring 
 
 update the camera presets for a better angle  
 
-
+test the lab camera for the results if it can be used as the main camera
 
 
 2026-04-07_09.18.02.mkv  _ medium 24
