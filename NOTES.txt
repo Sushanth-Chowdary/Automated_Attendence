@@ -6,11 +6,6 @@ clean the clusterring
 
 update the camera presets for a better angle  
 
-test the lab camera for the results if it can be used as the main camera
-
-fix ptz normal camera when zoomed in it is not working as shown  (grain noise drease it as much as possible)
-
-
 
 
 2026-04-07_09.18.02.mkv  _ medium 24
