@@ -44,9 +44,9 @@ with open(metadata_path, 'rb') as f:
 target_names = saved_data['target_names']
 
 # 4. Define Parameters & Setup Batch Processing
-CONFIDENCE_THRESHOLD = 0.85
-REQUIRED_FRAMES_TO_ATTEND = 100 
-FRAME_SKIP = 2                 
+CONFIDENCE_THRESHOLD = 0.90
+REQUIRED_FRAMES_TO_ATTEND = 190 
+FRAME_SKIP = 1                 
 
 input_dir = 'VIDEOS'
 output_dir = 'ATTENDENCE RESULTS/MINE'

@@ -32,7 +32,7 @@ print(f"Running PyTorch on device: {device}")
 mtcnn = MTCNN(keep_all=False, device=device)
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
-dataset_path = './BALANCED_LABELS'
+dataset_path = './LABELS'
 
 to_tensor = transforms.Compose([
     transforms.Resize((160, 160)),
