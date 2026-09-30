@@ -6,10 +6,17 @@ clean the clusterring
 
 update the camera presets for a better angle  
 
+current latest pipelines on replacing anything
 
+detection , clustering , recogniton - 1 each
+
+clustering first
+
+testing on the lab camera 
+
+checking and prooces to keep the lab camera in the class 
 
 labels 200K samples
-
 
 5 min-
 
