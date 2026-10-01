@@ -1,6 +1,6 @@
-ready the videos of different protocols for the attendece prossecing(segment the usefull videos )
+ready the videos of different protocols for the attendece prossecing(how ??)
 
-update the process attendance
+update the process attendance to be compatible and way to do the attecdece (how ??)
 
 clean the clusterring 
 
@@ -20,12 +20,6 @@ labels 200K samples
 
 5 min-
 
-20260930_094942_cam1_raw.mp4
-20260910_105502_cam2_raw.mp4
-20260910_105502_cam1_raw.mp4
-20260930_094942_cam2_raw.mp4
-20260821_115222_cam1_raw.mp4
-20260821_115222_cam2_raw.mp4
 20260828_110647_cam2_raw.mp4
 20260828_110647_cam1_raw.mp4
 20260821_110602_cam1_raw.mp4
@@ -40,7 +34,6 @@ labels 200K samples
 20260807_114029_cam2_raw.mp4
 20260818_100113_cam2_raw.mp4
 20260825_100359_cam1_raw.mp4
-20260924_124323_cam_raw.mp4
 20260915_100118_cam1_raw.mp4
 20260922_100505_cam1_raw.mp4
 20260814_110338_cam1_raw.mp4
@@ -85,11 +78,8 @@ labels 200K samples
 20260929_104553_cam2_raw.mp4
 20260929_100534_cam2_raw.mp4
 20260821_114611_cam2_raw.mp4
-20260827_130316_cam2_raw.mp4
 20260901_100242_cam2_raw.mp4
 20260925_114434_cam2_raw.mp4
-20260827_130316_cam1_raw.mp4
-20260825_105052_cam1_raw.mp4
 
 10 min-
 

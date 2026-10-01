@@ -9,7 +9,6 @@ import os
 from tqdm import tqdm  
 from collections import Counter
 import faiss
-import subprocess 
 import threading
 import queue
 import torchvision.transforms as transforms
@@ -17,9 +16,7 @@ import torchvision.ops as ops
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
 
-# ==========================================
-# THREADED VIDEO I/O HELPER 
-# ==========================================
+
 class ThreadedVideoReader:
     def __init__(self, path, queue_size=128):
         self.cap = cv2.VideoCapture(path)
@@ -42,12 +39,10 @@ class ThreadedVideoReader:
             if not ret:
                 self.stopped = True
                 break
-            while not self.stopped:
-                try:
-                    self.q.put(frame, timeout=0.5)
-                    break 
-                except queue.Full:
-                    continue
+            try:
+                self.q.put(frame, timeout=2.0)
+            except queue.Full:
+                continue
         self.cap.release()
 
     def read(self):
@@ -58,9 +53,29 @@ class ThreadedVideoReader:
 
     def stop(self):
         self.stopped = True
-        while not self.q.empty():
-            try: self.q.get_nowait()
-            except queue.Empty: break
+
+def video_writer_worker(write_queue, output_path, fps, width, height):
+    """Handles CPU drawing and slow video encoding in the background."""
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+    while True:
+        item = write_queue.get()
+        if item is None: 
+            break
+            
+        frame, boxes_cpu, ids_list, names = item
+        
+
+        for i in range(len(ids_list)):
+            box = boxes_cpu[i]
+            t_id = ids_list[i]
+            name = names[i]
+            color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
+            cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
+            cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+        out.write(frame)
+    out.release()
+
 
 def format_timestamp(frame_count, fps):
     total_seconds = frame_count // fps
@@ -107,7 +122,6 @@ FRAMES_PER_VOTE = 5
 input_dir = 'VIDEOS'
 output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
 os.makedirs(output_dir, exist_ok=True)
-video_staging_dir = os.path.abspath('.')
 
 target_videos = ['2026-04-27_10.02.44.mkv', '2026-02-25_11.23.07.mkv', '2026-03-05_11.02.28.mkv', '2026-03-09_10.03.16.mkv', '2026-04-07_09.18.02.mkv', 'video2.mkv', '2026-02-25_11.21.17.mkv', '2026-03-09_10.04.35.mkv', '2026-02-25_11.03.43.mkv', '2026-02-18_11.02.03.mkv', 'video1_uajX8qg0.mp4', '2026-02-25_11.00.04.mkv', '2026-02-25_11.15.41.mkv', '2026-03-02_09.55.37.mkv']
 
@@ -170,8 +184,12 @@ for video_filename in target_videos:
     
     video_stream = ThreadedVideoReader(os.path.join(input_dir, video_filename)).start()
     video_stem = os.path.splitext(video_filename)[0]
-    staging_video_path = os.path.join(video_staging_dir, f"{video_stem}_output.mp4")
-    out = cv2.VideoWriter(staging_video_path, cv2.VideoWriter_fourcc(*'mp4v'), video_stream.fps, (video_stream.frame_width, video_stream.frame_height))
+    final_video_path = os.path.join(output_dir, f"{video_stem}_output.mp4")
+    
+    write_queue = queue.Queue(maxsize=128)
+    writer_thread = threading.Thread(target=video_writer_worker, args=(write_queue, final_video_path, video_stream.fps, video_stream.frame_width, video_stream.frame_height))
+    writer_thread.daemon = True
+    writer_thread.start()
     
     active_track_memory, archived_tracks, track_identities = {}, {}, {}
     frame_count = 0
@@ -182,11 +200,14 @@ for video_filename in target_videos:
                 frame = video_stream.read()
                 if frame is None: break 
                 
-                # Move frame to GPU inherently 
                 frame_tensor = torch.from_numpy(frame).to(device, non_blocking=True).float()
                 
                 results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False, quantize=16 if use_half else None, imgsz=640)
                 has_detections = results[0].boxes.id is not None
+                
+                boxes_cpu = []
+                ids_list = []
+                frame_names = []
                 
                 if has_detections and ref_embeddings_tensor is not None:
                     boxes = results[0].boxes.xyxy.to(device) 
@@ -259,7 +280,7 @@ for video_filename in target_videos:
                                         valid_batch_tensor = valid_batch_tensor.half()
                                     
                                     embeddings = resnet(valid_batch_tensor)
-                                    embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+                                    embeddings = torch.nn.normalize(embeddings, p=2, dim=1)
                                     
                                     sim_matrix = torch.mm(embeddings, ref_embeddings_tensor.t())
                                     max_sims, max_indices = torch.max(sim_matrix, dim=1)
@@ -281,13 +302,9 @@ for video_filename in target_videos:
                     boxes_cpu = boxes.cpu().numpy()
                     for i in range(len(ids_list)):
                         t_id = ids_list[i]
-                        box = boxes_cpu[i]
-                        name = track_identities.get(t_id, "Analyzing...")
-                        color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
-                        cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
-                        cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        frame_names.append(track_identities.get(t_id, "Analyzing..."))
                         
-                out.write(frame)
+                write_queue.put((frame, boxes_cpu, ids_list, frame_names))
                 
                 alive_ids = set(ids_list) if has_detections else set()
                 for t_id in list(active_track_memory.keys()):
@@ -305,10 +322,8 @@ for video_filename in target_videos:
         interrupted = True
     finally:
         video_stream.stop()
-        out.release()
+        write_queue.put(None)
+        writer_thread.join()  
         
-        final_video_path = os.path.join(output_dir, f"{video_stem}_output.mp4")
-        try: subprocess.run(['mv', staging_video_path, final_video_path], check=True)
-        except: pass
         save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
     if interrupted: break
