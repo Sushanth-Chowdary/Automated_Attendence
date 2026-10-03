@@ -240,6 +240,6 @@ def process_attendance(base_dir, target_folder):
 if __name__ == "__main__":
     # Ensure this matches your file paths
     BASE_DIRECTORY = "ATTENDENCE RESULTS/Results"
-    TARGET_FOLDER = "test 22"
+    TARGET_FOLDER = "test 1"
     
     process_attendance(BASE_DIRECTORY, TARGET_FOLDER)

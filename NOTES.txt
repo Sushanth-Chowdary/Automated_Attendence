@@ -1,10 +1,7 @@
-ready the videos of different protocols for the attendece prossecing(how ??)
-
-update the process attendance to be compatible and way to do the attecdece (how ??)
-
 clean the clusterring 
 
 update the camera presets for a better angle  
+___________________________________________________________________________________________________________________________________________________________
 
 current latest pipelines on replacing anything
 
@@ -16,7 +13,12 @@ testing on the lab camera
 
 checking and prooces to keep the lab camera in the class 
 
+___________________________________________________________________________________________________________________________________________________________
+
 labels 200K samples
+
+151 videos , 20 days , 30 hours
+___________________________________________________________________________________________________________________________________________________________
 
 5 min-
 
