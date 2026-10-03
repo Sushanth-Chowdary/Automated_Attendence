@@ -6,6 +6,8 @@ import pickle
 import pandas as pd
 from datetime import datetime
 import os
+import glob
+import gc
 from tqdm import tqdm  
 from collections import Counter
 import faiss
@@ -54,6 +56,7 @@ class ThreadedVideoReader:
     def stop(self):
         self.stopped = True
 
+
 def video_writer_worker(write_queue, output_path, fps, width, height):
     """Handles CPU drawing and slow video encoding in the background."""
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
@@ -63,7 +66,6 @@ def video_writer_worker(write_queue, output_path, fps, width, height):
             break
             
         frame, boxes_cpu, ids_list, names = item
-        
 
         for i in range(len(ids_list)):
             box = boxes_cpu[i]
@@ -83,14 +85,23 @@ def format_timestamp(frame_count, fps):
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-# 2. Setup
+
+# 2. Setup Models and Embeddings
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 use_half = torch.cuda.is_available() 
 
+print(f"Running on device: {device} | Half-Precision: {use_half}")
+
+# Load YOLO once outside the loop to avoid memory fragmentation
+yolo_model = YOLO('yolov8n-face.pt', task='detect')
+yolo_model.to(device)
+
+# Load InceptionResnetV1
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 if use_half:
     resnet = resnet.half()
 
+# Load FAISS Gallery
 faiss_index_path = './face_attendance_faiss.bin'
 ref_embeddings_tensor = None
 if os.path.exists(faiss_index_path):
@@ -109,12 +120,13 @@ if os.path.exists(faiss_index_path):
             ref_embeddings_tensor = ref_embeddings_tensor.half()
     except Exception as e:
         print(f"Failed to extract FAISS vectors to GPU: {e}")
-        
+
 with open('./face_attendance_meta.pkl', 'rb') as f:
     saved_data = pickle.load(f)
 target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
-# 3. Parameters
+
+# 3. Parameters & Directory Scanning
 CONFIDENCE_THRESHOLD = 0.79     
 FRAME_SKIP = 1                  
 FRAMES_PER_VOTE = 5          
@@ -123,7 +135,15 @@ input_dir = 'VIDEOS'
 output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
 os.makedirs(output_dir, exist_ok=True)
 
-target_videos = ['2026-04-27_10.02.44.mkv', '2026-02-25_11.23.07.mkv', '2026-03-05_11.02.28.mkv', '2026-03-09_10.03.16.mkv', '2026-04-07_09.18.02.mkv', 'video2.mkv', '2026-02-25_11.21.17.mkv', '2026-03-09_10.04.35.mkv', '2026-02-25_11.03.43.mkv', '2026-02-18_11.02.03.mkv', 'video1_uajX8qg0.mp4', '2026-02-25_11.00.04.mkv', '2026-02-25_11.15.41.mkv', '2026-03-02_09.55.37.mkv']
+# Dynamically scan VIDEOS folder for all supported video formats
+video_extensions = ('.mp4', '.mkv', '.avi', '.mov')
+target_videos = sorted([
+    f for f in os.listdir(input_dir)
+    if f.lower().endswith(video_extensions) and not f.startswith('.')
+])
+
+print(f"Found {len(target_videos)} video files in '{input_dir}'.")
+
 
 def save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir):
     final_mem = {**archived_tracks, **active_track_memory}
@@ -175,19 +195,30 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
     pd.DataFrame(output_data).to_csv(os.path.join(output_dir, f"{stem}_output.csv"), index=False)
     print(f"  -> Saved attendance + debug CSVs for {video_filename}")
 
+
+# 4. Processing Loop
 interrupted = False
-for video_filename in target_videos:
-    if not os.path.exists(os.path.join(input_dir, video_filename)): continue
-    print(f"\nProcessing: {video_filename}")
-    yolo_model = YOLO('yolov8n-face.pt', task='detect')
-    yolo_model.to(device)
-    
-    video_stream = ThreadedVideoReader(os.path.join(input_dir, video_filename)).start()
+
+for idx, video_filename in enumerate(target_videos, start=1):
+    video_path = os.path.join(input_dir, video_filename)
     video_stem = os.path.splitext(video_filename)[0]
+    output_csv = os.path.join(output_dir, f"{video_stem}_output.csv")
     final_video_path = os.path.join(output_dir, f"{video_stem}_output.mp4")
+
+    # Resume capability: Skip video if already processed
+    if os.path.exists(output_csv):
+        print(f"[{idx}/{len(target_videos)}] Skipping (already processed): {video_filename}")
+        continue
+
+    print(f"\n[{idx}/{len(target_videos)}] Processing: {video_filename}")
+    
+    video_stream = ThreadedVideoReader(video_path).start()
     
     write_queue = queue.Queue(maxsize=128)
-    writer_thread = threading.Thread(target=video_writer_worker, args=(write_queue, final_video_path, video_stream.fps, video_stream.frame_width, video_stream.frame_height))
+    writer_thread = threading.Thread(
+        target=video_writer_worker, 
+        args=(write_queue, final_video_path, video_stream.fps, video_stream.frame_width, video_stream.frame_height)
+    )
     writer_thread.daemon = True
     writer_thread.start()
     
@@ -198,11 +229,19 @@ for video_filename in target_videos:
         with tqdm(total=video_stream.total_frames, unit="frame") as pbar:
             while video_stream.more():
                 frame = video_stream.read()
-                if frame is None: break 
+                if frame is None: 
+                    break 
                 
                 frame_tensor = torch.from_numpy(frame).to(device, non_blocking=True).float()
                 
-                results = yolo_model.track(frame, persist=True, tracker="custom_bytetrack.yaml", verbose=False, quantize=16 if use_half else None, imgsz=640)
+                results = yolo_model.track(
+                    frame, 
+                    persist=True, 
+                    tracker="custom_bytetrack.yaml", 
+                    verbose=False, 
+                    quantize=16 if use_half else None, 
+                    imgsz=640
+                )
                 has_detections = results[0].boxes.id is not None
                 
                 boxes_cpu = []
@@ -319,6 +358,7 @@ for video_filename in target_videos:
                 pbar.update(1)
 
     except KeyboardInterrupt:
+        print("\nInterrupted by user. Cleaning up current video...")
         interrupted = True
     finally:
         video_stream.stop()
@@ -326,4 +366,13 @@ for video_filename in target_videos:
         writer_thread.join()  
         
         save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
-    if interrupted: break
+        
+        # Free memory between video runs
+        del active_track_memory, archived_tracks, track_identities
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if interrupted:
+        print("Batch processing halted.")
+        break
