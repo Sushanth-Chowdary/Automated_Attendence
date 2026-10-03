@@ -7,16 +7,29 @@ from openpyxl.utils import get_column_letter
 
 def process_attendance(base_dir, target_folder):
     input_dir = os.path.join(base_dir, target_folder)
+    
+    # Define file paths
     true_attendance_path = os.path.join(base_dir, "filtered_true_attendance.csv")
+    name_mapping_path = os.path.join(base_dir, "name_mapping.csv")
+    protocol_mapping_path = os.path.join(base_dir, "protocol_mapping.csv")
     
-    if not os.path.exists(true_attendance_path):
-        print(f"Error: Could not find True Attendance file at {true_attendance_path}")
-        return
+    # 1. Check if required files exist
+    for path in [true_attendance_path, name_mapping_path, protocol_mapping_path]:
+        if not os.path.exists(path):
+            print(f"Error: Could not find required file at {path}")
+            return
 
-    # Load True Attendance
+    # 2. Load True Attendance and Mappings
     true_df = pd.read_csv(true_attendance_path)
-    true_df = true_df.set_index(true_df.columns[0]) 
+    true_df = true_df.set_index(true_df.columns[0]) # Assuming Roll_Name is the first column
     
+    name_map_df = pd.read_csv(name_mapping_path).dropna(subset=['Short_Name', 'Roll_Name'])
+    short_to_roll = dict(zip(name_map_df['Short_Name'].str.strip(), name_map_df['Roll_Name'].str.strip()))
+    
+    protocol_map_df = pd.read_csv(protocol_mapping_path)
+    base_to_protocol = dict(zip(protocol_map_df['Base_Timestamp'].astype(str).str.strip(), protocol_map_df['Protocol_Length'].astype(str).str.strip()))
+    
+    # 3. Scan for video output CSVs
     file_pattern = os.path.join(input_dir, "*_output.csv")
     output_files = glob.glob(file_pattern)
     
@@ -24,106 +37,139 @@ def process_attendance(base_dir, target_folder):
         print(f"No output CSV files found in {input_dir}")
         return
 
-    dfs = []
-    dates = []
-
-    print("Processing files...")
+    # 4. Group files by base timestamp (to pair cam1 and cam2)
+    sessions = {}
     for file in output_files:
         filename = os.path.basename(file)
-        date_str = filename.replace("_output.csv", "")
-        dates.append(date_str)
-        
-        temp_df = pd.read_csv(file)
-        temp_df = temp_df[['Name', 'Status', 'Detection Count']]
-        temp_df = temp_df.rename(columns={'Status': 'Estimated', 'Detection Count': 'Count'})
-        temp_df = temp_df.set_index('Name')
-        
-        if date_str in true_df.columns:
-            temp_df['True'] = true_df[date_str]
-        else:
-            temp_df['True'] = "Unknown" 
-            
-        temp_df = temp_df[['Estimated', 'Count', 'True']]
-        temp_df.columns = pd.MultiIndex.from_product([[date_str], temp_df.columns])
-        dfs.append(temp_df)
+        # Assuming filename format: 20260828_110647_cam1_raw_output.csv
+        parts = filename.split('_')
+        if len(parts) >= 2:
+            base_timestamp = f"{parts[0]}_{parts[1]}"
+            if base_timestamp not in sessions:
+                sessions[base_timestamp] = []
+            sessions[base_timestamp].append(file)
 
-    combined_df = pd.concat(dfs, axis=1)
-    combined_df.index.name = 'Student Name'
+    dfs = []
+    timestamps_ordered = sorted(list(sessions.keys()))
+
+    print("Processing grouped camera files and calculating union...")
     
-    # Sort students alphabetically
+    for ts in timestamps_ordered:
+        date_str = ts.split('_')[0]
+        protocol = base_to_protocol.get(ts, "Unknown Length")
+        
+        session_files = sessions[ts]
+        
+        # Read and merge cam1 and cam2 (or just one if the other is missing)
+        cam_dfs = [pd.read_csv(f) for f in session_files]
+        merged_cams = pd.concat(cam_dfs, ignore_index=True)
+        
+        # Map Short Names to Roll Names
+        merged_cams['Name'] = merged_cams['Name'].str.strip()
+        merged_cams['Roll_Name'] = merged_cams['Name'].map(short_to_roll).fillna(merged_cams['Name'])
+        
+        # Determine logical Union (Present if ANY camera says Present)
+        merged_cams['Is_Present'] = merged_cams['Status'].str.strip().str.lower() == 'present'
+        
+        grouped = merged_cams.groupby('Roll_Name').agg(
+            Is_Present=('Is_Present', 'any'),
+            Detection_Count=('Detection Count', 'sum') # Sum the counts from both cams
+        ).reset_index()
+        
+        grouped['Estimated'] = grouped['Is_Present'].apply(lambda x: 'Present' if x else 'Absent')
+        grouped = grouped.rename(columns={'Detection_Count': 'Count'})
+        grouped = grouped.set_index('Roll_Name')
+        
+        # Fetch True Attendance for the specific date
+        if date_str in true_df.columns:
+            grouped['True'] = true_df[date_str]
+        else:
+            grouped['True'] = "Unknown" 
+            
+        grouped = grouped[['Estimated', 'Count', 'True']]
+        
+        # Setup 3-tier MultiIndex: Date -> Timestamp (Protocol) -> Data Columns
+        header_level_2 = f"{ts} ({protocol})"
+        grouped.columns = pd.MultiIndex.from_product([[date_str], [header_level_2], grouped.columns])
+        dfs.append(grouped)
+
+    # 5. Combine everything into one large DataFrame
+    combined_df = pd.concat(dfs, axis=1)
+    combined_df.index.name = 'Student Name & Roll No'
     combined_df = combined_df.sort_index()
     
-    # --- CALCULATE EFFICIENCY ---
+    # 6. Calculate Efficiency across all protocols
     student_matches = pd.Series(0, index=combined_df.index)
-    valid_sessions = len(dates)
+    valid_sessions = len(timestamps_ordered)
     total_students = len(combined_df)
     
     date_efficiencies = {}
     
-    for date in dates:
-        est_col = combined_df[(date, 'Estimated')].astype(str).str.strip().str.lower()
-        true_col = combined_df[(date, 'True')].astype(str).str.strip().str.lower()
+    for ts in timestamps_ordered:
+        date_str = ts.split('_')[0]
+        protocol = base_to_protocol.get(ts, "Unknown Length")
+        col_group = f"{ts} ({protocol})"
         
-        matches = (est_col == true_col)
+        est_col = combined_df[(date_str, col_group, 'Estimated')].astype(str).str.strip().str.lower()
+        true_col = combined_df[(date_str, col_group, 'True')].astype(str).str.strip().str.lower()
+        
+        # Calculate matching accuracy
+        matches = (est_col == true_col) & (true_col != 'unknown') & (true_col != 'nan')
         student_matches += matches.astype(int)
         
-        date_accuracy = (matches.sum() / total_students) * 100
-        date_efficiencies[(date, 'Estimated')] = f"{date_accuracy:.2f}%"
-        date_efficiencies[(date, 'Count')] = ""
-        date_efficiencies[(date, 'True')] = ""
+        valid_student_count = ((true_col != 'unknown') & (true_col != 'nan')).sum()
+        date_accuracy = (matches.sum() / valid_student_count * 100) if valid_student_count > 0 else 0.0
+        
+        date_efficiencies[(date_str, col_group, 'Estimated')] = f"{date_accuracy:.2f}%"
+        date_efficiencies[(date_str, col_group, 'Count')] = ""
+        date_efficiencies[(date_str, col_group, 'True')] = ""
 
-    combined_df[('Overall', 'Efficiency')] = (student_matches / valid_sessions * 100).apply(lambda x: f"{x:.2f}%")
+    # Add overall efficiency column
+    combined_df[('Overall', 'Summary', 'Efficiency')] = (student_matches / valid_sessions * 100).apply(lambda x: f"{x:.2f}%")
     
+    # Add bottom summary row
+    eff_df = pd.DataFrame([date_efficiencies], index=['EFFICIENCY'])
     total_matches_all = student_matches.sum()
     total_possible_data_points = total_students * valid_sessions
-    overall_avg_efficiency = (total_matches_all / total_possible_data_points) * 100
+    eff_df[('Overall', 'Summary', 'Efficiency')] = f"{(total_matches_all / total_possible_data_points * 100):.2f}%" 
     
-    date_efficiencies[('Overall', 'Efficiency')] = f"{overall_avg_efficiency:.2f}%" 
-    
-    efficiency_row = pd.DataFrame([date_efficiencies], index=['EFFICIENCY'])
-    combined_df = pd.concat([combined_df, efficiency_row])
+    combined_df = pd.concat([combined_df, eff_df])
 
-    # --- SAVE FILES ---
+    # 7. Save Files
     csv_output = os.path.join(input_dir, "Final_Report_With_Efficiency.csv")
     xlsx_output = os.path.join(input_dir, "Final_Report_With_Efficiency.xlsx")
 
-    print("Saving files...")
+    print("Saving merged CSV and formatting Excel report...")
     combined_df.to_csv(csv_output)
     combined_df.to_excel(xlsx_output)
 
-    # --- EXCEL FORMATTING ---
+    # 8. Excel Formatting for 3-Tier MultiIndex
     wb = openpyxl.load_workbook(xlsx_output)
     ws = wb.active
     ws.title = "Attendance Efficiency"
 
-    # 1. Fix the Pandas layout quirks
-    ws['A1'] = 'Student Names'
-    ws.merge_cells('A1:A2')
-    ws.delete_rows(3) # Removes the blank row generated by Pandas multi-index
+    # Cleanup the Pandas 3-tier index export quirks
+    ws['A1'] = 'Student Name & Roll No'
+    ws.merge_cells('A1:A3')
+    ws.delete_rows(4) # Removes the blank row generated beneath the headers
     
     max_row = ws.max_row
     max_col = ws.max_column
 
-    # 2. Style Definitions
     header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
-    
     green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     green_font = Font(color="006100")
-    
     red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
     red_font = Font(color="9C0006")
-    
-    red_bold_font = Font(color="9C0006", bold=True)
     summary_fill = PatternFill(start_color="D5F5E3", end_color="D5F5E3", fill_type="solid")
-    
-    center_align = Alignment(horizontal="center", vertical="center")
+    center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left_align = Alignment(horizontal="left", vertical="center")
     thin_border = Border(left=Side(style='thin', color='BDC3C7'), right=Side(style='thin', color='BDC3C7'), 
                          top=Side(style='thin', color='BDC3C7'), bottom=Side(style='thin', color='BDC3C7'))
 
-    # Format Headers (Rows 1 and 2)
-    for row in range(1, 3):
+    # Format Headers (Rows 1, 2, and 3)
+    for row in range(1, 4):
         for cell in ws[row]:
             try:
                 cell.fill = header_fill
@@ -132,10 +178,9 @@ def process_attendance(base_dir, target_folder):
                 cell.border = thin_border
             except AttributeError:
                 pass
-    ws['A1'].alignment = center_align # Ensure merged Student Name is centered
 
     # Format Data Rows
-    for row_idx in range(3, max_row):
+    for row_idx in range(4, max_row):
         for col_idx, cell in enumerate(ws[row_idx], start=1):
             try:
                 cell.alignment = left_align if col_idx == 1 else center_align
@@ -144,7 +189,6 @@ def process_attendance(base_dir, target_folder):
                 if row_idx % 2 == 0:
                     cell.fill = PatternFill(start_color="F8F9F9", end_color="F8F9F9", fill_type="solid")
                     
-                # Color Coding
                 val = str(cell.value).strip().lower()
                 if val == 'present':
                     cell.fill = green_fill
@@ -153,8 +197,7 @@ def process_attendance(base_dir, target_folder):
                     cell.fill = red_fill
                     cell.font = red_font
                 elif val.endswith('%'):
-                    num = float(val.strip('%'))
-                    if num < 80.0:
+                    if float(val.strip('%')) < 80.0:
                         cell.fill = red_fill
                         cell.font = red_font
             except (AttributeError, ValueError):
@@ -168,37 +211,34 @@ def process_attendance(base_dir, target_folder):
             cell.fill = summary_fill
             cell.font = Font(bold=True)
             
-            # Check for < 80% on summary row
             val = str(cell.value).strip().lower()
-            if val.endswith('%'):
-                num = float(val.strip('%'))
-                if num < 80.0:
-                    cell.fill = red_fill
-                    cell.font = red_bold_font
+            if val.endswith('%') and float(val.strip('%')) < 80.0:
+                cell.fill = red_fill
+                cell.font = Font(color="9C0006", bold=True)
         except (AttributeError, ValueError):
             pass
 
-    # Merge bottom row columns (Estimated, Count, True) into one wide cell per date
-    for i in range(len(dates)):
-        start_col = 2 + (i * 3) # B is 2, E is 5, H is 8...
+    # Dynamic Merging for the bottom row (Merging Estimated, Count, True)
+    for i in range(len(timestamps_ordered)):
+        start_col = 2 + (i * 3)
         end_col = start_col + 2
         ws.merge_cells(start_row=max_row, start_column=start_col, end_row=max_row, end_column=end_col)
 
     # Adjust column widths
     for col_idx in range(1, max_col + 1):
         col_letter = get_column_letter(col_idx)
-        ws.column_dimensions[col_letter].width = 14
-    ws.column_dimensions['A'].width = 22 # Wider for Student Names
+        ws.column_dimensions[col_letter].width = 15
+    ws.column_dimensions['A'].width = 35
 
-    # Freeze panes
-    ws.freeze_panes = "B3"
-    
+    ws.freeze_panes = "B4"
     wb.save(xlsx_output)
-    print(f"\nSuccess! Files saved in: {input_dir}")
-    print(f" -> {os.path.basename(csv_output)}")
-    print(f" -> {os.path.basename(xlsx_output)}")
+    
+    print(f"\nSuccess! Reports generated:")
+    print(f" -> {csv_output}")
+    print(f" -> {xlsx_output}")
 
 if __name__ == "__main__":
+    # Ensure this matches your file paths
     BASE_DIRECTORY = "ATTENDENCE RESULTS/Results"
     TARGET_FOLDER = "test 22"
     
