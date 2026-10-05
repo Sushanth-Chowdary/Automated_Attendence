@@ -11,7 +11,7 @@ print(f"Running on device: {device}")
 
 # Directories
 TARGET_DIR = './Extraceted Data'
-VIDEOS_DIR = os.path.join(TARGET_DIR, 'VIDEOS')
+VIDEOS_DIR = os.path.join(TARGET_DIR, 'VIDEOS_faces')
 FACES_DIR = os.path.join(TARGET_DIR, 'extracted_faces') 
 
 # Create necessary directories (Safe creation)
