@@ -239,7 +239,7 @@ for idx, video_filename in enumerate(target_videos, start=1):
                     persist=True, 
                     tracker="custom_bytetrack.yaml", 
                     verbose=False, 
-                    quantize=16 if use_half else None, 
+                    half=use_half, 
                     imgsz=640
                 )
                 has_detections = results[0].boxes.id is not None
