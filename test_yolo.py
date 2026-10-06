@@ -16,13 +16,16 @@ import cv2
 import faiss
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 import torch
 import torchvision.ops as ops
 import torchvision.transforms as transforms
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
+
+from rich.live import Live
+from rich.table import Table
+from rich.progress import Progress, BarColumn, TextColumn
 
 # Suppress serialization warnings from third-party weights
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -149,7 +152,6 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
 
 
 # 2. Worker Lifecycle & Models
-# Stored globally within each worker process space
 yolo_model = None
 resnet = None
 ref_embeddings_tensor = None
@@ -163,8 +165,7 @@ def init_worker():
     """Initializes models once per worker process to prevent redundant reload overhead."""
     global yolo_model, resnet, ref_embeddings_tensor, target_names, y_real, device, use_half
     
-    # Stagger boot times across processes to prevent simultaneous disk read collisions
-    time.sleep(random.uniform(0.2, 3.0))
+    time.sleep(random.uniform(0.2, 2.5))
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     use_half = torch.cuda.is_available()
@@ -204,8 +205,8 @@ def init_worker():
     target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
 
-def process_video(video_filename, input_dir, output_dir):
-    """Processes a single video utilizing pre-warmed worker model instances."""
+def process_video(video_filename, input_dir, output_dir, progress_q):
+    """Processes a single video and pushes live telemetry through progress_q."""
     global yolo_model, resnet, ref_embeddings_tensor, target_names, y_real, device, use_half
 
     video_path = os.path.join(input_dir, video_filename)
@@ -215,6 +216,7 @@ def process_video(video_filename, input_dir, output_dir):
 
     # Resume capability: Skip if already finished
     if os.path.exists(output_csv):
+        progress_q.put({"type": "skip", "file": video_filename})
         return video_filename, "Skipped"
 
     CONFIDENCE_THRESHOLD = 0.79     
@@ -222,7 +224,10 @@ def process_video(video_filename, input_dir, output_dir):
     FRAMES_PER_VOTE = 5
 
     video_stream = ThreadedVideoReader(video_path).start()
+    total_frames = max(video_stream.total_frames, 1)
     
+    progress_q.put({"type": "start", "file": video_filename, "total_frames": total_frames})
+
     write_queue = queue.Queue(maxsize=128)
     writer_thread = threading.Thread(
         target=video_writer_worker, 
@@ -233,6 +238,8 @@ def process_video(video_filename, input_dir, output_dir):
     
     active_track_memory, archived_tracks, track_identities = {}, {}, {}
     frame_count = 0
+    t_start = time.perf_counter()
+    last_q_time = t_start
 
     try:
         while video_stream.more():
@@ -363,8 +370,22 @@ def process_video(video_filename, input_dir, output_dir):
                     active_track_memory[t_id]['missing_frames'] = 0
 
             frame_count += 1
+            
+            # Send status update every 10 frames to keep queue overhead negligible
+            if frame_count % 10 == 0:
+                now = time.perf_counter()
+                elapsed = now - t_start
+                curr_fps = frame_count / elapsed if elapsed > 0 else 0.0
+                progress_q.put({
+                    "type": "progress",
+                    "file": video_filename,
+                    "frame": frame_count,
+                    "total": total_frames,
+                    "fps": curr_fps
+                })
 
     except Exception as e:
+        progress_q.put({"type": "finish", "file": video_filename})
         return video_filename, f"Error: {str(e)}"
     finally:
         video_stream.stop()
@@ -372,7 +393,8 @@ def process_video(video_filename, input_dir, output_dir):
         writer_thread.join()  
         
         save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
-        
+        progress_q.put({"type": "finish", "file": video_filename})
+
         del active_track_memory, archived_tracks, track_identities
         gc.collect()
         if torch.cuda.is_available():
@@ -381,11 +403,67 @@ def process_video(video_filename, input_dir, output_dir):
     return video_filename, "Processed"
 
 
-# 3. Main Entry Point
+# 3. Terminal Live Dashboard
+def run_live_dashboard(progress_q, total_videos, stop_event):
+    """Renders a real-time console table displaying progress and FPS per video."""
+    active_videos = {}
+    completed = 0
+
+    with Live(auto_refresh=False, refresh_per_second=4) as live:
+        while not stop_event.is_set() or not progress_q.empty():
+            # Flush queue messages
+            while True:
+                try:
+                    msg = progress_q.get_nowait()
+                    msg_type = msg.get("type")
+                    filename = msg.get("file")
+
+                    if msg_type == "start":
+                        active_videos[filename] = {
+                            "frame": 0,
+                            "total": msg.get("total_frames", 1),
+                            "fps": 0.0
+                        }
+                    elif msg_type == "progress":
+                        if filename in active_videos:
+                            active_videos[filename]["frame"] = msg["frame"]
+                            active_videos[filename]["total"] = msg["total"]
+                            active_videos[filename]["fps"] = msg["fps"]
+                    elif msg_type in ("finish", "skip"):
+                        active_videos.pop(filename, None)
+                        completed += 1
+                except queue.Empty:
+                    break
+
+            # Construct dynamic table
+            table = Table(
+                title=f"[bold green]Batch Processing Progress ({completed}/{total_videos} Videos Finished)[/bold green]",
+                box=None
+            )
+            table.add_column("Running File", style="cyan", width=35, no_wrap=True)
+            table.add_column("Frames", style="magenta", width=18, justify="right")
+            table.add_column("Completion", style="yellow", width=12, justify="right")
+            table.add_column("FPS", style="green", width=10, justify="right")
+
+            if active_videos:
+                for fname, stat in sorted(active_videos.items()):
+                    pct = min(100.0, (stat["frame"] / stat["total"]) * 100) if stat["total"] > 0 else 0
+                    table.add_row(
+                        fname,
+                        f"{stat['frame']}/{stat['total']}",
+                        f"{pct:5.1f}%",
+                        f"{stat['fps']:5.1f}"
+                    )
+            else:
+                table.add_row("[italic dim]Waiting for worker threads...[/italic dim]", "-", "-", "-")
+
+            live.update(table, refresh=True)
+            time.sleep(0.2)
+
+
+# 4. Main Entry Point
 if __name__ == '__main__':
     mp.freeze_support()
-    
-    # Enforce spawn mode to prevent CUDA deadlocks across process forks
     ctx = mp.get_context('spawn')
 
     input_dir = 'VIDEOS'
@@ -398,27 +476,43 @@ if __name__ == '__main__':
         if f.lower().endswith(video_extensions) and not f.startswith('.')
     ])
 
-    print(f"Found {len(target_videos)} video files in '{input_dir}'.")
+    total_files = len(target_videos)
+    print(f"Found {total_files} video files in '{input_dir}'.")
     
-    # Set to 6 concurrent pipelines for ~9-10 GB total VRAM allocation on the RTX A4000
+    # 6 parallel pipelines for RTX A4000
     MAX_WORKERS = 6 
 
     if target_videos:
-        print(f"Booting {MAX_WORKERS} persistent hardware workers...")
+        # Multiprocessing Manager Queue for telemetry updates
+        manager = ctx.Manager()
+        progress_q = manager.Queue()
+        stop_event = threading.Event()
+
+        # Start background dashboard rendering thread
+        dashboard_thread = threading.Thread(
+            target=run_live_dashboard,
+            args=(progress_q, total_files, stop_event),
+            daemon=True
+        )
+        dashboard_thread.start()
+
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=MAX_WORKERS, 
             mp_context=ctx, 
             initializer=init_worker
         ) as executor:
-            futures = {executor.submit(process_video, video, input_dir, output_dir): video for video in target_videos}
+            futures = {
+                executor.submit(process_video, video, input_dir, output_dir, progress_q): video 
+                for video in target_videos
+            }
             
-            with tqdm(total=len(target_videos), desc="Batch Processed", unit="video") as pbar:
-                for future in concurrent.futures.as_completed(futures):
-                    video_filename = futures[future]
-                    try:
-                        _, status = future.result()
-                    except Exception as exc:
-                        print(f"\n  -> [CRASH] {video_filename} generated an exception: {exc}")
-                    pbar.update(1)
+            for future in concurrent.futures.as_completed(futures):
+                video_filename = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"\n  -> [CRASH] {video_filename} error: {exc}")
 
+        stop_event.set()
+        dashboard_thread.join(timeout=1.0)
         print("\nAll videos processed successfully.")
