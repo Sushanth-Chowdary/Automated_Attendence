@@ -1,24 +1,32 @@
 # 1. Imports
-import torch
-import numpy as np
-import cv2
-import pickle
-import pandas as pd
-from datetime import datetime
 import os
-import glob
 import gc
-from tqdm import tqdm  
-from collections import Counter
-import faiss
-import threading
+import time
 import queue
-import torchvision.transforms as transforms
+import random
+import pickle
+import warnings
+import threading
+from datetime import datetime
+from collections import Counter
+import concurrent.futures
+import multiprocessing as mp
+
+import cv2
+import faiss
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
 import torchvision.ops as ops
+import torchvision.transforms as transforms
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
-import multiprocessing as mp
-import concurrent.futures
+
+# Suppress serialization warnings from third-party weights
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 
 class ThreadedVideoReader:
     def __init__(self, path, queue_size=128):
@@ -49,21 +57,24 @@ class ThreadedVideoReader:
         self.cap.release()
 
     def read(self):
-        try: return self.q.get(timeout=2.0)
-        except queue.Empty: return None
+        try:
+            return self.q.get(timeout=2.0)
+        except queue.Empty:
+            return None
 
-    def more(self): return self.q.qsize() > 0 or not self.stopped
+    def more(self):
+        return self.q.qsize() > 0 or not self.stopped
 
     def stop(self):
         self.stopped = True
 
 
 def video_writer_worker(write_queue, output_path, fps, width, height):
-    """Handles CPU drawing and slow video encoding in the background."""
+    """Handles CPU drawing and video encoding in the background."""
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
     while True:
         item = write_queue.get()
-        if item is None: 
+        if item is None:
             break
             
         frame, boxes_cpu, ids_list, names = item
@@ -74,7 +85,7 @@ def video_writer_worker(write_queue, output_path, fps, width, height):
             name = names[i]
             color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
             cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
-            cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             
         out.write(frame)
     out.release()
@@ -137,27 +148,32 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
     pd.DataFrame(output_data).to_csv(os.path.join(output_dir, f"{stem}_output.csv"), index=False)
 
 
-# 2. Worker Function (Isolated GPU Contexts)
-def process_video(video_filename, input_dir, output_dir):
-    """
-    Standalone worker function. Models must be instantiated inside here
-    to prevent PyTorch CUDA fork context crashing across separate processes.
-    """
+# 2. Worker Lifecycle & Models
+# Stored globally within each worker process space
+yolo_model = None
+resnet = None
+ref_embeddings_tensor = None
+target_names = []
+y_real = []
+device = None
+use_half = False
+
+
+def init_worker():
+    """Initializes models once per worker process to prevent redundant reload overhead."""
+    global yolo_model, resnet, ref_embeddings_tensor, target_names, y_real, device, use_half
+    
+    # Stagger boot times across processes to prevent simultaneous disk read collisions
+    time.sleep(random.uniform(0.2, 3.0))
+
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    use_half = torch.cuda.is_available() 
+    use_half = torch.cuda.is_available()
 
-    video_path = os.path.join(input_dir, video_filename)
-    video_stem = os.path.splitext(video_filename)[0]
-    output_csv = os.path.join(output_dir, f"{video_stem}_output.csv")
-    final_video_path = os.path.join(output_dir, f"{video_stem}_output.mp4")
-
-    if os.path.exists(output_csv):
-        return video_filename, "Skipped"
-
-    # Initialize PyTorch Models
+    # Load YOLO
     yolo_model = YOLO('yolov8n-face.pt', task='detect')
     yolo_model.to(device)
 
+    # Load InceptionResnetV1
     resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
     if use_half:
         resnet = resnet.half()
@@ -179,18 +195,28 @@ def process_video(video_filename, input_dir, output_dir):
             ref_embeddings_tensor = torch.nn.functional.normalize(ref_embeddings_tensor, p=2, dim=1)
             if use_half:
                 ref_embeddings_tensor = ref_embeddings_tensor.half()
-        except Exception as e:
-            pass
+        except Exception:
+            ref_embeddings_tensor = None
 
     # Load Metadata
-    try:
-        with open('./face_attendance_meta.pkl', 'rb') as f:
-            saved_data = pickle.load(f)
-        target_names, y_real = saved_data['target_names'], saved_data['y_real']
-    except FileNotFoundError:
-        return video_filename, "Error: Missing Meta File"
+    with open('./face_attendance_meta.pkl', 'rb') as f:
+        saved_data = pickle.load(f)
+    target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
-    # Worker Configurations
+
+def process_video(video_filename, input_dir, output_dir):
+    """Processes a single video utilizing pre-warmed worker model instances."""
+    global yolo_model, resnet, ref_embeddings_tensor, target_names, y_real, device, use_half
+
+    video_path = os.path.join(input_dir, video_filename)
+    video_stem = os.path.splitext(video_filename)[0]
+    output_csv = os.path.join(output_dir, f"{video_stem}_output.csv")
+    final_video_path = os.path.join(output_dir, f"{video_stem}_output.mp4")
+
+    # Resume capability: Skip if already finished
+    if os.path.exists(output_csv):
+        return video_filename, "Skipped"
+
     CONFIDENCE_THRESHOLD = 0.79     
     FRAME_SKIP = 1                  
     FRAMES_PER_VOTE = 5
@@ -347,8 +373,7 @@ def process_video(video_filename, input_dir, output_dir):
         
         save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
         
-        # Free memory isolated to this process space
-        del active_track_memory, archived_tracks, track_identities, yolo_model, resnet, ref_embeddings_tensor
+        del active_track_memory, archived_tracks, track_identities
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -356,11 +381,12 @@ def process_video(video_filename, input_dir, output_dir):
     return video_filename, "Processed"
 
 
-# 3. Main Execution Block
+# 3. Main Entry Point
 if __name__ == '__main__':
-    # Mandatory for PyTorch multiprocessing environments
     mp.freeze_support()
-    mp.set_start_method('spawn', force=True)
+    
+    # Enforce spawn mode to prevent CUDA deadlocks across process forks
+    ctx = mp.get_context('spawn')
 
     input_dir = 'VIDEOS'
     output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
@@ -374,24 +400,25 @@ if __name__ == '__main__':
 
     print(f"Found {len(target_videos)} video files in '{input_dir}'.")
     
-    # Configure your parallel pipelines here. 
-    # An RTX A4000 (16GB) can comfortably run 6-8 instances of this YOLO+ResNet setup simultaneously.
+    # Set to 6 concurrent pipelines for ~9-10 GB total VRAM allocation on the RTX A4000
     MAX_WORKERS = 6 
 
     if target_videos:
-        print(f"Booting {MAX_WORKERS} simultaneous hardware workers...")
-        with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        print(f"Booting {MAX_WORKERS} persistent hardware workers...")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=MAX_WORKERS, 
+            mp_context=ctx, 
+            initializer=init_worker
+        ) as executor:
             futures = {executor.submit(process_video, video, input_dir, output_dir): video for video in target_videos}
             
-            # Replaced the individual frame tqdm with a master file-progress bar
-            with tqdm(total=len(target_videos), desc="Batch Processed") as pbar:
+            with tqdm(total=len(target_videos), desc="Batch Processed", unit="video") as pbar:
                 for future in concurrent.futures.as_completed(futures):
                     video_filename = futures[future]
                     try:
                         _, status = future.result()
-                        # print(f"  -> [{status}] {video_filename}") 
                     except Exception as exc:
-                        print(f"  -> [CRASH] {video_filename} generated an exception: {exc}")
+                        print(f"\n  -> [CRASH] {video_filename} generated an exception: {exc}")
                     pbar.update(1)
 
         print("\nAll videos processed successfully.")
