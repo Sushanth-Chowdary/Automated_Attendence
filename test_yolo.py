@@ -17,7 +17,8 @@ import torchvision.transforms as transforms
 import torchvision.ops as ops
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
-
+import multiprocessing as mp
+import concurrent.futures
 
 class ThreadedVideoReader:
     def __init__(self, path, queue_size=128):
@@ -86,65 +87,6 @@ def format_timestamp(frame_count, fps):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-# 2. Setup Models and Embeddings
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-use_half = torch.cuda.is_available() 
-
-print(f"Running on device: {device} | Half-Precision: {use_half}")
-
-# Load YOLO once outside the loop to avoid memory fragmentation
-yolo_model = YOLO('yolov8n-face.pt', task='detect')
-yolo_model.to(device)
-
-# Load InceptionResnetV1
-resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-if use_half:
-    resnet = resnet.half()
-
-# Load FAISS Gallery
-faiss_index_path = './face_attendance_faiss.bin'
-ref_embeddings_tensor = None
-if os.path.exists(faiss_index_path):
-    index = faiss.read_index(faiss_index_path)
-    index.nprobe = 20
-    try:
-        try:
-            ref_embeddings = index.reconstruct_n(0, index.ntotal)
-        except AttributeError:
-            index.make_direct_map()
-            ref_embeddings = np.array([index.reconstruct(i) for i in range(index.ntotal)])
-        
-        ref_embeddings_tensor = torch.from_numpy(ref_embeddings).to(device).float()
-        ref_embeddings_tensor = torch.nn.functional.normalize(ref_embeddings_tensor, p=2, dim=1)
-        if use_half:
-            ref_embeddings_tensor = ref_embeddings_tensor.half()
-    except Exception as e:
-        print(f"Failed to extract FAISS vectors to GPU: {e}")
-
-with open('./face_attendance_meta.pkl', 'rb') as f:
-    saved_data = pickle.load(f)
-target_names, y_real = saved_data['target_names'], saved_data['y_real']
-
-
-# 3. Parameters & Directory Scanning
-CONFIDENCE_THRESHOLD = 0.79     
-FRAME_SKIP = 1                  
-FRAMES_PER_VOTE = 5          
-
-input_dir = 'VIDEOS'
-output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
-os.makedirs(output_dir, exist_ok=True)
-
-# Dynamically scan VIDEOS folder for all supported video formats
-video_extensions = ('.mp4', '.mkv', '.avi', '.mov')
-target_videos = sorted([
-    f for f in os.listdir(input_dir)
-    if f.lower().endswith(video_extensions) and not f.startswith('.')
-])
-
-print(f"Found {len(target_videos)} video files in '{input_dir}'.")
-
-
 def save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir):
     final_mem = {**archived_tracks, **active_track_memory}
     debug_data = []
@@ -193,25 +135,66 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
     
     output_data = [{'Name': s, 'Status': 'Present' if student_presence[s] else 'Absent', 'Detection Count': student_detection_count[s]} for s in target_names]
     pd.DataFrame(output_data).to_csv(os.path.join(output_dir, f"{stem}_output.csv"), index=False)
-    print(f"  -> Saved attendance + debug CSVs for {video_filename}")
 
 
-# 4. Processing Loop
-interrupted = False
+# 2. Worker Function (Isolated GPU Contexts)
+def process_video(video_filename, input_dir, output_dir):
+    """
+    Standalone worker function. Models must be instantiated inside here
+    to prevent PyTorch CUDA fork context crashing across separate processes.
+    """
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    use_half = torch.cuda.is_available() 
 
-for idx, video_filename in enumerate(target_videos, start=1):
     video_path = os.path.join(input_dir, video_filename)
     video_stem = os.path.splitext(video_filename)[0]
     output_csv = os.path.join(output_dir, f"{video_stem}_output.csv")
     final_video_path = os.path.join(output_dir, f"{video_stem}_output.mp4")
 
-    # Resume capability: Skip video if already processed
     if os.path.exists(output_csv):
-        print(f"[{idx}/{len(target_videos)}] Skipping (already processed): {video_filename}")
-        continue
+        return video_filename, "Skipped"
 
-    print(f"\n[{idx}/{len(target_videos)}] Processing: {video_filename}")
-    
+    # Initialize PyTorch Models
+    yolo_model = YOLO('yolov8n-face.pt', task='detect')
+    yolo_model.to(device)
+
+    resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+    if use_half:
+        resnet = resnet.half()
+
+    # Load FAISS Gallery
+    faiss_index_path = './face_attendance_faiss.bin'
+    ref_embeddings_tensor = None
+    if os.path.exists(faiss_index_path):
+        index = faiss.read_index(faiss_index_path)
+        index.nprobe = 20
+        try:
+            try:
+                ref_embeddings = index.reconstruct_n(0, index.ntotal)
+            except AttributeError:
+                index.make_direct_map()
+                ref_embeddings = np.array([index.reconstruct(i) for i in range(index.ntotal)])
+            
+            ref_embeddings_tensor = torch.from_numpy(ref_embeddings).to(device).float()
+            ref_embeddings_tensor = torch.nn.functional.normalize(ref_embeddings_tensor, p=2, dim=1)
+            if use_half:
+                ref_embeddings_tensor = ref_embeddings_tensor.half()
+        except Exception as e:
+            pass
+
+    # Load Metadata
+    try:
+        with open('./face_attendance_meta.pkl', 'rb') as f:
+            saved_data = pickle.load(f)
+        target_names, y_real = saved_data['target_names'], saved_data['y_real']
+    except FileNotFoundError:
+        return video_filename, "Error: Missing Meta File"
+
+    # Worker Configurations
+    CONFIDENCE_THRESHOLD = 0.79     
+    FRAME_SKIP = 1                  
+    FRAMES_PER_VOTE = 5
+
     video_stream = ThreadedVideoReader(video_path).start()
     
     write_queue = queue.Queue(maxsize=128)
@@ -226,140 +209,137 @@ for idx, video_filename in enumerate(target_videos, start=1):
     frame_count = 0
 
     try:
-        with tqdm(total=video_stream.total_frames, unit="frame") as pbar:
-            while video_stream.more():
-                frame = video_stream.read()
-                if frame is None: 
-                    break 
+        while video_stream.more():
+            frame = video_stream.read()
+            if frame is None: 
+                break 
+            
+            frame_tensor = torch.from_numpy(frame).to(device, non_blocking=True).float()
+            
+            results = yolo_model.track(
+                frame, 
+                persist=True, 
+                tracker="custom_bytetrack.yaml", 
+                verbose=False, 
+                half=use_half, 
+                imgsz=640
+            )
+            has_detections = results[0].boxes.id is not None
+            
+            boxes_cpu = []
+            ids_list = []
+            frame_names = []
+            
+            if has_detections and ref_embeddings_tensor is not None:
+                boxes = results[0].boxes.xyxy.to(device) 
+                ids = results[0].boxes.id.to(device).int() 
                 
-                frame_tensor = torch.from_numpy(frame).to(device, non_blocking=True).float()
-                
-                results = yolo_model.track(
-                    frame, 
-                    persist=True, 
-                    tracker="custom_bytetrack.yaml", 
-                    verbose=False, 
-                    half=use_half, 
-                    imgsz=640
-                )
-                has_detections = results[0].boxes.id is not None
-                
-                boxes_cpu = []
-                ids_list = []
-                frame_names = []
-                
-                if has_detections and ref_embeddings_tensor is not None:
-                    boxes = results[0].boxes.xyxy.to(device) 
-                    ids = results[0].boxes.id.to(device).int() 
+                ids_list = ids.cpu().tolist()
+                for t_id in ids_list:
+                    if t_id not in active_track_memory:
+                        active_track_memory[t_id] = {
+                            'start_time': format_timestamp(frame_count, video_stream.fps),
+                            'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0,
+                            'crop_buffer': []
+                        }
+                    active_track_memory[t_id]['frames_alive'] += 1
+
+                if frame_count % FRAME_SKIP == 0:
+                    batch_tensors, batch_track_ids = [], []
                     
-                    ids_list = ids.cpu().tolist()
-                    for t_id in ids_list:
-                        if t_id not in active_track_memory:
-                            active_track_memory[t_id] = {
-                                'start_time': format_timestamp(frame_count, video_stream.fps),
-                                'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0,
-                                'crop_buffer': []
-                            }
-                        active_track_memory[t_id]['frames_alive'] += 1
-
-                    if frame_count % FRAME_SKIP == 0:
-                        batch_tensors, batch_track_ids = [], []
+                    box_w = boxes[:, 2] - boxes[:, 0]
+                    box_h = boxes[:, 3] - boxes[:, 1]
+                    aspect_ratios = box_w / (box_h + 1e-6)
+                    
+                    valid_mask = (box_w >= 65) & (box_h >= 65) & (aspect_ratios >= 0.55) & (aspect_ratios <= 1.55)
+                    
+                    if valid_mask.any():
+                        valid_boxes = boxes[valid_mask].clone()
+                        valid_ids = ids[valid_mask]
                         
-                        box_w = boxes[:, 2] - boxes[:, 0]
-                        box_h = boxes[:, 3] - boxes[:, 1]
-                        aspect_ratios = box_w / (box_h + 1e-6)
+                        margin_x = (valid_boxes[:, 2] - valid_boxes[:, 0]) * 0.15
+                        margin_y = (valid_boxes[:, 3] - valid_boxes[:, 1]) * 0.15
                         
-                        valid_mask = (box_w >= 65) & (box_h >= 65) & (aspect_ratios >= 0.55) & (aspect_ratios <= 1.55)
+                        valid_boxes[:, 0] = torch.clamp(valid_boxes[:, 0] - margin_x, min=0)
+                        valid_boxes[:, 1] = torch.clamp(valid_boxes[:, 1] - margin_y, min=0)
+                        valid_boxes[:, 2] = torch.clamp(valid_boxes[:, 2] + margin_x, max=float(frame.shape[1]))
+                        valid_boxes[:, 3] = torch.clamp(valid_boxes[:, 3] + margin_y, max=float(frame.shape[0]))
                         
-                        if valid_mask.any():
-                            valid_boxes = boxes[valid_mask].clone()
-                            valid_ids = ids[valid_mask]
+                        batch_idx = torch.zeros((valid_boxes.size(0), 1), device=device, dtype=valid_boxes.dtype)
+                        roi_boxes = torch.cat((batch_idx, valid_boxes), dim=1)
+                        
+                        frame_tensor_chw = frame_tensor.permute(2, 0, 1).unsqueeze(0)
+                        crops = ops.roi_align(frame_tensor_chw, roi_boxes, output_size=(160, 160)).detach()
+                        
+                        valid_ids_list = valid_ids.cpu().tolist()
+                        for i, t_id in enumerate(valid_ids_list):
+                            active_track_memory[t_id]['crop_buffer'].append(crops[i:i+1])
                             
-                            margin_x = (valid_boxes[:, 2] - valid_boxes[:, 0]) * 0.15
-                            margin_y = (valid_boxes[:, 3] - valid_boxes[:, 1]) * 0.15
+                            if len(active_track_memory[t_id]['crop_buffer']) >= FRAMES_PER_VOTE:
+                                batch_tensors.extend(active_track_memory[t_id]['crop_buffer'])
+                                batch_track_ids.extend([t_id] * len(active_track_memory[t_id]['crop_buffer']))
+                                active_track_memory[t_id]['crop_buffer'] = []
+                    
+                    if batch_tensors:
+                        with torch.inference_mode():
+                            batch_tensor = torch.cat(batch_tensors, dim=0) 
+                            batch_tensor = batch_tensor[:, [2, 1, 0], :, :] 
                             
-                            valid_boxes[:, 0] = torch.clamp(valid_boxes[:, 0] - margin_x, min=0)
-                            valid_boxes[:, 1] = torch.clamp(valid_boxes[:, 1] - margin_y, min=0)
-                            valid_boxes[:, 2] = torch.clamp(valid_boxes[:, 2] + margin_x, max=float(frame.shape[1]))
-                            valid_boxes[:, 3] = torch.clamp(valid_boxes[:, 3] + margin_y, max=float(frame.shape[0]))
+                            gray = transforms.functional.rgb_to_grayscale(batch_tensor)
+                            laplacian_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
+                            laplacian_out = torch.nn.functional.conv2d(gray, laplacian_kernel, padding=1)
+                            laplacian_var = torch.var(laplacian_out, dim=(1, 2, 3))
                             
-                            batch_idx = torch.zeros((valid_boxes.size(0), 1), device=device, dtype=valid_boxes.dtype)
-                            roi_boxes = torch.cat((batch_idx, valid_boxes), dim=1)
+                            mask = laplacian_var > 5.0
+                            mask_list = mask.cpu().tolist()
+                            valid_batch_tensor = batch_tensor[mask]
+                            valid_batch_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if mask_list[k]]
                             
-                            frame_tensor_chw = frame_tensor.permute(2, 0, 1).unsqueeze(0)
-                            crops = ops.roi_align(frame_tensor_chw, roi_boxes, output_size=(160, 160)).detach()
-                            
-                            valid_ids_list = valid_ids.cpu().tolist()
-                            for i, t_id in enumerate(valid_ids_list):
-                                active_track_memory[t_id]['crop_buffer'].append(crops[i:i+1])
+                            if valid_batch_tensor.size(0) > 0:
+                                valid_batch_tensor = (valid_batch_tensor / 127.5) - 1.0
+                                if use_half:
+                                    valid_batch_tensor = valid_batch_tensor.half()
                                 
-                                if len(active_track_memory[t_id]['crop_buffer']) >= FRAMES_PER_VOTE:
-                                    batch_tensors.extend(active_track_memory[t_id]['crop_buffer'])
-                                    batch_track_ids.extend([t_id] * len(active_track_memory[t_id]['crop_buffer']))
-                                    active_track_memory[t_id]['crop_buffer'] = []
-                        
-                        if batch_tensors:
-                            with torch.inference_mode():
-                                batch_tensor = torch.cat(batch_tensors, dim=0) 
-                                batch_tensor = batch_tensor[:, [2, 1, 0], :, :] 
+                                embeddings = resnet(valid_batch_tensor)
+                                embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
                                 
-                                gray = transforms.functional.rgb_to_grayscale(batch_tensor)
-                                laplacian_kernel = torch.tensor([[[[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]]]], device=device, dtype=batch_tensor.dtype)
-                                laplacian_out = torch.nn.functional.conv2d(gray, laplacian_kernel, padding=1)
-                                laplacian_var = torch.var(laplacian_out, dim=(1, 2, 3))
+                                sim_matrix = torch.mm(embeddings, ref_embeddings_tensor.t())
+                                max_sims, max_indices = torch.max(sim_matrix, dim=1)
                                 
-                                mask = laplacian_var > 5.0
-                                mask_list = mask.cpu().tolist()
-                                valid_batch_tensor = batch_tensor[mask]
-                                valid_batch_track_ids = [batch_track_ids[k] for k in range(len(batch_track_ids)) if mask_list[k]]
+                                sims_list = max_sims.cpu().tolist()
+                                indices_list = max_indices.cpu().tolist()
                                 
-                                if valid_batch_tensor.size(0) > 0:
-                                    valid_batch_tensor = (valid_batch_tensor / 127.5) - 1.0
-                                    if use_half:
-                                        valid_batch_tensor = valid_batch_tensor.half()
+                                for i, t_id in enumerate(valid_batch_track_ids):
+                                    name = target_names[y_real[indices_list[i]]] if sims_list[i] > CONFIDENCE_THRESHOLD else "Unknown"
+                                    active_track_memory[t_id]['buffer'].append(name)
+                                    active_track_memory[t_id]['all_preds'].append(name)
                                     
-                                    embeddings = resnet(valid_batch_tensor)
-                                    embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-                                    
-                                    sim_matrix = torch.mm(embeddings, ref_embeddings_tensor.t())
-                                    max_sims, max_indices = torch.max(sim_matrix, dim=1)
-                                    
-                                    sims_list = max_sims.cpu().tolist()
-                                    indices_list = max_indices.cpu().tolist()
-                                    
-                                    for i, t_id in enumerate(valid_batch_track_ids):
-                                        name = target_names[y_real[indices_list[i]]] if sims_list[i] > CONFIDENCE_THRESHOLD else "Unknown"
-                                        active_track_memory[t_id]['buffer'].append(name)
-                                        active_track_memory[t_id]['all_preds'].append(name)
-                                        
-                                        if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
-                                            valid_history = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
-                                            winner = Counter(valid_history).most_common(1)[0][0] if valid_history else "Unknown"
-                                            track_identities[t_id] = winner
-                                            active_track_memory[t_id]['buffer'] = []
+                                    if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
+                                        valid_history = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
+                                        winner = Counter(valid_history).most_common(1)[0][0] if valid_history else "Unknown"
+                                        track_identities[t_id] = winner
+                                        active_track_memory[t_id]['buffer'] = []
 
-                    boxes_cpu = boxes.cpu().numpy()
-                    for i in range(len(ids_list)):
-                        t_id = ids_list[i]
-                        frame_names.append(track_identities.get(t_id, "Analyzing..."))
-                        
-                write_queue.put((frame, boxes_cpu, ids_list, frame_names))
-                
-                alive_ids = set(ids_list) if has_detections else set()
-                for t_id in list(active_track_memory.keys()):
-                    if t_id not in alive_ids:
-                        active_track_memory[t_id]['missing_frames'] += 1
-                        if active_track_memory[t_id]['missing_frames'] > 50:
-                            archived_tracks[t_id] = active_track_memory.pop(t_id)
-                    else:
-                        active_track_memory[t_id]['missing_frames'] = 0
+                boxes_cpu = boxes.cpu().numpy()
+                for i in range(len(ids_list)):
+                    t_id = ids_list[i]
+                    frame_names.append(track_identities.get(t_id, "Analyzing..."))
+                    
+            write_queue.put((frame, boxes_cpu, ids_list, frame_names))
+            
+            alive_ids = set(ids_list) if has_detections else set()
+            for t_id in list(active_track_memory.keys()):
+                if t_id not in alive_ids:
+                    active_track_memory[t_id]['missing_frames'] += 1
+                    if active_track_memory[t_id]['missing_frames'] > 50:
+                        archived_tracks[t_id] = active_track_memory.pop(t_id)
+                else:
+                    active_track_memory[t_id]['missing_frames'] = 0
 
-                frame_count += 1
-                pbar.update(1)
+            frame_count += 1
 
-    except KeyboardInterrupt:
-        print("\nInterrupted by user. Cleaning up current video...")
-        interrupted = True
+    except Exception as e:
+        return video_filename, f"Error: {str(e)}"
     finally:
         video_stream.stop()
         write_queue.put(None)
@@ -367,12 +347,51 @@ for idx, video_filename in enumerate(target_videos, start=1):
         
         save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
         
-        # Free memory between video runs
-        del active_track_memory, archived_tracks, track_identities
+        # Free memory isolated to this process space
+        del active_track_memory, archived_tracks, track_identities, yolo_model, resnet, ref_embeddings_tensor
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    if interrupted:
-        print("Batch processing halted.")
-        break
+    return video_filename, "Processed"
+
+
+# 3. Main Execution Block
+if __name__ == '__main__':
+    # Mandatory for PyTorch multiprocessing environments
+    mp.freeze_support()
+    mp.set_start_method('spawn', force=True)
+
+    input_dir = 'VIDEOS'
+    output_dir = os.path.abspath('ATTENDENCE RESULTS/MINE')
+    os.makedirs(output_dir, exist_ok=True)
+
+    video_extensions = ('.mp4', '.mkv', '.avi', '.mov')
+    target_videos = sorted([
+        f for f in os.listdir(input_dir)
+        if f.lower().endswith(video_extensions) and not f.startswith('.')
+    ])
+
+    print(f"Found {len(target_videos)} video files in '{input_dir}'.")
+    
+    # Configure your parallel pipelines here. 
+    # An RTX A4000 (16GB) can comfortably run 6-8 instances of this YOLO+ResNet setup simultaneously.
+    MAX_WORKERS = 6 
+
+    if target_videos:
+        print(f"Booting {MAX_WORKERS} simultaneous hardware workers...")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process_video, video, input_dir, output_dir): video for video in target_videos}
+            
+            # Replaced the individual frame tqdm with a master file-progress bar
+            with tqdm(total=len(target_videos), desc="Batch Processed") as pbar:
+                for future in concurrent.futures.as_completed(futures):
+                    video_filename = futures[future]
+                    try:
+                        _, status = future.result()
+                        # print(f"  -> [{status}] {video_filename}") 
+                    except Exception as exc:
+                        print(f"  -> [CRASH] {video_filename} generated an exception: {exc}")
+                    pbar.update(1)
+
+        print("\nAll videos processed successfully.")
