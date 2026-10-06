@@ -319,7 +319,7 @@ for idx, video_filename in enumerate(target_videos, start=1):
                                         valid_batch_tensor = valid_batch_tensor.half()
                                     
                                     embeddings = resnet(valid_batch_tensor)
-                                    embeddings = torch.nn.normalize(embeddings, p=2, dim=1)
+                                    embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
                                     
                                     sim_matrix = torch.mm(embeddings, ref_embeddings_tensor.t())
                                     max_sims, max_indices = torch.max(sim_matrix, dim=1)
