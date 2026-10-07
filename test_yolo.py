@@ -515,4 +515,5 @@ if __name__ == '__main__':
 
         stop_event.set()
         dashboard_thread.join(timeout=1.0)
+        
         print("\nAll videos processed successfully.")
