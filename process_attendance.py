@@ -1,6 +1,7 @@
 import os
 import glob
 import pandas as pd
+import numpy as np
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -19,23 +20,29 @@ def process_attendance(base_dir, target_folder):
             print(f"Error: Could not find required file at {path}")
             return
 
-    # 2. Load True Attendance and Mappings safely as string types
+    # 2. Load True Attendance and Create Roll + Name Combo
     true_df = pd.read_csv(true_attendance_path)
     
-    # Force the index (Roll Numbers) to be strictly stripped strings
-    true_df.iloc[:, 0] = true_df.iloc[:, 0].astype(str).str.strip()
-    true_df = true_df.set_index(true_df.columns[0])
+    roll_col = true_df.iloc[:, 0].astype(str).str.strip()
+    name_col = true_df.iloc[:, 1].astype(str).str.strip()
     
-    # CRITICAL FIX: Force column headers to be strings, strip spaces, AND REMOVE HYPHENS
-    # This matches '2026-08-07' from the CSV to '20260807' from the video filename
+    # Create mapping dictionary to convert Roll No to "Roll No - Student Name"
+    true_df['Combo_Name'] = roll_col + " - " + name_col
+    roll_to_combo = dict(zip(roll_col, true_df['Combo_Name']))
+    
+    # Force index to be strictly stripped Roll Numbers
+    true_df = true_df.set_index(roll_col)
+    
+    # Clean up True Attendance headers (strip spaces and remove hyphens to match video dates)
     true_df.columns = true_df.columns.astype(str).str.strip().str.replace('-', '')
     
-    # Strip the true attendance cells to remove hidden spaces around 'Present'/'Absent'
+    # Clean cells to remove hidden spaces
     for col in true_df.columns:
-        true_df[col] = true_df[col].astype(str).str.strip()
+        if col != 'Combo_Name':
+            true_df[col] = true_df[col].astype(str).str.strip()
     
+    # Load mappings
     name_map_df = pd.read_csv(name_mapping_path).dropna(subset=['Short_Name', 'Roll_Name'])
-    # Filter out empty or whitespace-only rows
     name_map_df = name_map_df[name_map_df['Short_Name'].astype(str).str.strip() != '']
     short_to_roll = dict(zip(
         name_map_df['Short_Name'].astype(str).str.strip(),
@@ -60,7 +67,6 @@ def process_attendance(base_dir, target_folder):
     sessions = {}
     for file in output_files:
         filename = os.path.basename(file)
-        # Assuming filename format: 20260828_110647_cam1_raw_output.csv
         parts = filename.split('_')
         if len(parts) >= 2:
             base_timestamp = f"{parts[0]}_{parts[1]}"
@@ -79,20 +85,17 @@ def process_attendance(base_dir, target_folder):
         
         session_files = sessions[ts]
         
-        # Read and merge cam1 and cam2 (or just one if the other is missing)
         cam_dfs = [pd.read_csv(f) for f in session_files]
         merged_cams = pd.concat(cam_dfs, ignore_index=True)
         
-        # Safely map Short Names to Roll Names
         merged_cams['Name'] = merged_cams['Name'].astype(str).str.strip()
         merged_cams['Roll_Name'] = merged_cams['Name'].map(short_to_roll).fillna(merged_cams['Name'])
         
-        # Determine logical Union (Present if ANY camera says Present)
         merged_cams['Is_Present'] = merged_cams['Status'].astype(str).str.strip().str.lower() == 'present'
         
         grouped = merged_cams.groupby('Roll_Name').agg(
             Is_Present=('Is_Present', 'any'),
-            Detection_Count=('Detection Count', 'sum')  # Sum counts from both cams
+            Detection_Count=('Detection Count', 'sum') 
         ).reset_index()
         
         grouped['Estimated'] = grouped['Is_Present'].apply(lambda x: 'Present' if x else 'Absent')
@@ -103,58 +106,104 @@ def process_attendance(base_dir, target_folder):
         if date_str in true_df.columns:
             grouped['True'] = true_df[date_str]
         else:
-            grouped['True'] = "Unknown" 
+            grouped['True'] = ""  # Leave blank if no true data exists for this date
             
         grouped = grouped[['Estimated', 'Count', 'True']]
         
-        # Setup 3-tier MultiIndex: Date -> Timestamp (Protocol) -> Data Columns
         header_level_2 = f"{ts} ({protocol})"
         grouped.columns = pd.MultiIndex.from_product([[date_str], [header_level_2], grouped.columns])
         dfs.append(grouped)
 
-    # 5. Combine everything into one large DataFrame
+    # 5. Combine and rename index to Full Combo Name
     combined_df = pd.concat(dfs, axis=1)
+    combined_df.index = combined_df.index.map(lambda x: roll_to_combo.get(str(x), str(x)))
     combined_df.index.name = 'Student Name & Roll No'
     combined_df = combined_df.sort_index()
     
-    # 6. Calculate Efficiency across all protocols
-    student_matches = pd.Series(0, index=combined_df.index)
-    valid_sessions = len(timestamps_ordered)
-    total_students = len(combined_df)
+    # 6. Calculate Efficiencies
+    student_matches = pd.Series(0.0, index=combined_df.index)
+    student_valid = pd.Series(0.0, index=combined_df.index)
     
     date_efficiencies = {}
+    protocol_stats = {}
+    
+    total_matches_overall = 0
+    total_possible_overall = 0
     
     for ts in timestamps_ordered:
         date_str = ts.split('_')[0]
         protocol = base_to_protocol.get(ts, "Unknown Length")
         col_group = f"{ts} ({protocol})"
         
+        if protocol not in protocol_stats:
+            protocol_stats[protocol] = {'matches': 0, 'total': 0}
+            
         est_col = combined_df[(date_str, col_group, 'Estimated')].astype(str).str.strip().str.lower()
         true_col = combined_df[(date_str, col_group, 'True')].astype(str).str.strip().str.lower()
         
-        # Calculate matching accuracy
-        matches = (est_col == true_col) & (~true_col.isin(['unknown', 'nan', 'none', '']))
+        # Determine which students have valid true attendance data for this session
+        valid_mask = (~true_col.isin(['unknown', 'nan', 'none', ''])) & (true_col != '')
+        matches = (est_col == true_col) & valid_mask
+        
+        # Add to student-level trackers
         student_matches += matches.astype(int)
+        student_valid += valid_mask.astype(int)
         
-        valid_student_count = (~true_col.isin(['unknown', 'nan', 'none', ''])).sum()
-        date_accuracy = (matches.sum() / valid_student_count * 100) if valid_student_count > 0 else 0.0
+        # Session-level stats
+        current_matches = matches.sum()
+        current_total = valid_mask.sum()
         
-        date_efficiencies[(date_str, col_group, 'Estimated')] = f"{date_accuracy:.2f}%"
+        if current_total > 0:
+            date_accuracy = (current_matches / current_total) * 100
+            date_efficiencies[(date_str, col_group, 'Estimated')] = f"{date_accuracy:.2f}%"
+            
+            # Protocol and Overall trackers
+            protocol_stats[protocol]['matches'] += current_matches
+            protocol_stats[protocol]['total'] += current_total
+            total_matches_overall += current_matches
+            total_possible_overall += current_total
+        else:
+            date_efficiencies[(date_str, col_group, 'Estimated')] = "N/A"
+            
         date_efficiencies[(date_str, col_group, 'Count')] = ""
         date_efficiencies[(date_str, col_group, 'True')] = ""
 
-    # Add overall efficiency column
-    combined_df[('Overall', 'Summary', 'Efficiency')] = (student_matches / valid_sessions * 100).apply(lambda x: f"{x:.2f}%")
+    # Calculate overall efficiency per student
+    student_eff_series = pd.Series(pd.NA, index=combined_df.index)
+    mask = student_valid > 0
+    student_eff_series[mask] = (student_matches[mask] / student_valid[mask]) * 100
+    combined_df[('Overall', 'Summary', 'Efficiency')] = student_eff_series.apply(
+        lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A"
+    )
     
-    # Add bottom summary row
-    eff_df = pd.DataFrame([date_efficiencies], index=['EFFICIENCY'])
-    total_matches_all = student_matches.sum()
-    total_possible_data_points = total_students * valid_sessions
-    eff_df[('Overall', 'Summary', 'Efficiency')] = f"{(total_matches_all / total_possible_data_points * 100):.2f}%" 
+    # 7. Append Summary Rows
+    summary_rows = []
     
-    combined_df = pd.concat([combined_df, eff_df])
+    # Session efficiency row
+    date_efficiencies[('Overall', 'Summary', 'Efficiency')] = ""
+    summary_rows.append(pd.DataFrame([date_efficiencies], index=['SESSION EFFICIENCY']))
+    
+    # Protocol average rows
+    for prot, stats in protocol_stats.items():
+        if stats['total'] > 0:
+            prot_eff = (stats['matches'] / stats['total']) * 100
+            prot_row = {col: "" for col in combined_df.columns}
+            prot_row[('Overall', 'Summary', 'Efficiency')] = f"{prot_eff:.2f}%"
+            summary_rows.append(pd.DataFrame([prot_row], index=[f'{prot} AVERAGE']))
+            
+    # Overall efficiency row
+    overall_row = {col: "" for col in combined_df.columns}
+    if total_possible_overall > 0:
+        overall_eff = (total_matches_overall / total_possible_overall) * 100
+        overall_row[('Overall', 'Summary', 'Efficiency')] = f"{overall_eff:.2f}%"
+    else:
+        overall_row[('Overall', 'Summary', 'Efficiency')] = "N/A"
+    summary_rows.append(pd.DataFrame([overall_row], index=['OVERALL EFFICIENCY']))
+    
+    # Combine data and summaries
+    combined_df = pd.concat([combined_df] + summary_rows)
 
-    # 7. Save Files
+    # 8. Save Files
     csv_output = os.path.join(input_dir, "Final_Report_With_Efficiency.csv")
     xlsx_output = os.path.join(input_dir, "Final_Report_With_Efficiency.xlsx")
 
@@ -162,18 +211,20 @@ def process_attendance(base_dir, target_folder):
     combined_df.to_csv(csv_output)
     combined_df.to_excel(xlsx_output)
 
-    # 8. Excel Formatting for 3-Tier MultiIndex
+    # 9. Excel Formatting
     wb = openpyxl.load_workbook(xlsx_output)
     ws = wb.active
     ws.title = "Attendance Efficiency"
 
-    # Cleanup the Pandas 3-tier index export quirks
     ws['A1'] = 'Student Name & Roll No'
     ws.merge_cells('A1:A3')
-    ws.delete_rows(4)  # Removes the blank row generated beneath the headers
+    ws.delete_rows(4)  
     
     max_row = ws.max_row
     max_col = ws.max_column
+    
+    num_summary_rows = len(summary_rows)
+    start_summary_row = max_row - num_summary_rows + 1
 
     header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
@@ -199,7 +250,7 @@ def process_attendance(base_dir, target_folder):
                 pass
 
     # Format Data Rows
-    for row_idx in range(4, max_row):
+    for row_idx in range(4, start_summary_row):
         for col_idx, cell in enumerate(ws[row_idx], start=1):
             try:
                 cell.alignment = left_align if col_idx == 1 else center_align
@@ -222,32 +273,35 @@ def process_attendance(base_dir, target_folder):
             except (AttributeError, ValueError):
                 pass
 
-    # Format the bottom DATE EFFICIENCY row
-    for col_idx, cell in enumerate(ws[max_row], start=1):
-        try:
-            cell.alignment = center_align
-            cell.border = thin_border
-            cell.fill = summary_fill
-            cell.font = Font(bold=True)
-            
-            val = str(cell.value).strip().lower()
-            if val.endswith('%') and float(val.strip('%')) < 80.0:
-                cell.fill = red_fill
-                cell.font = Font(color="9C0006", bold=True)
-        except (AttributeError, ValueError):
-            pass
+    # Format Summary Rows
+    for row_idx in range(start_summary_row, max_row + 1):
+        for col_idx, cell in enumerate(ws[row_idx], start=1):
+            try:
+                cell.alignment = center_align if col_idx > 1 else left_align
+                cell.border = thin_border
+                cell.fill = summary_fill
+                cell.font = Font(bold=True)
+                
+                val = str(cell.value).strip().lower()
+                if val.endswith('%') and val != 'n/a':
+                    if float(val.strip('%')) < 80.0:
+                        cell.fill = red_fill
+                        cell.font = Font(color="9C0006", bold=True)
+            except (AttributeError, ValueError):
+                pass
 
-    # Dynamic Merging for the bottom row (Merging Estimated, Count, True)
+    # Merge cells for Estimated, Count, True within the Summary Rows
     for i in range(len(timestamps_ordered)):
         start_col = 2 + (i * 3)
         end_col = start_col + 2
-        ws.merge_cells(start_row=max_row, start_column=start_col, end_row=max_row, end_column=end_col)
+        for row_idx in range(start_summary_row, max_row + 1):
+            ws.merge_cells(start_row=row_idx, start_column=start_col, end_row=row_idx, end_column=end_col)
 
     # Adjust column widths
     for col_idx in range(1, max_col + 1):
         col_letter = get_column_letter(col_idx)
         ws.column_dimensions[col_letter].width = 15
-    ws.column_dimensions['A'].width = 35
+    ws.column_dimensions['A'].width = 38 # Widened for "Roll No - Full Name"
 
     ws.freeze_panes = "B4"
     wb.save(xlsx_output)
