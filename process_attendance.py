@@ -21,10 +21,18 @@ def process_attendance(base_dir, target_folder):
 
     # 2. Load True Attendance and Mappings safely as string types
     true_df = pd.read_csv(true_attendance_path)
+    
+    # Force the index (Roll Numbers) to be strictly stripped strings
     true_df.iloc[:, 0] = true_df.iloc[:, 0].astype(str).str.strip()
     true_df = true_df.set_index(true_df.columns[0])
-    # Ensure column headers (dates) are string type for reliable key matching
-    true_df.columns = true_df.columns.astype(str).str.strip()
+    
+    # CRITICAL FIX: Force column headers to be strings, strip spaces, AND REMOVE HYPHENS
+    # This matches '2026-08-07' from the CSV to '20260807' from the video filename
+    true_df.columns = true_df.columns.astype(str).str.strip().str.replace('-', '')
+    
+    # Strip the true attendance cells to remove hidden spaces around 'Present'/'Absent'
+    for col in true_df.columns:
+        true_df[col] = true_df[col].astype(str).str.strip()
     
     name_map_df = pd.read_csv(name_mapping_path).dropna(subset=['Short_Name', 'Roll_Name'])
     # Filter out empty or whitespace-only rows
@@ -250,6 +258,6 @@ def process_attendance(base_dir, target_folder):
 
 if __name__ == "__main__":
     BASE_DIRECTORY = "ATTENDENCE RESULTS/Results"
-    TARGET_FOLDER = "test 1"  # Update with your target test folder name
+    TARGET_FOLDER = "test 1" 
     
     process_attendance(BASE_DIRECTORY, TARGET_FOLDER)
