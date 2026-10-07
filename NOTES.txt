@@ -1,6 +1,8 @@
 clean the labels and add/remove data
 
-update the camera presets for a better angle  
+name_mapping
+
+update the camera presets for a better angle  *****
 ___________________________________________________________________________________________________________________________________________________________
 
 current latest pipelines on replacing anything

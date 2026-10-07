@@ -19,15 +19,26 @@ def process_attendance(base_dir, target_folder):
             print(f"Error: Could not find required file at {path}")
             return
 
-    # 2. Load True Attendance and Mappings
+    # 2. Load True Attendance and Mappings safely as string types
     true_df = pd.read_csv(true_attendance_path)
-    true_df = true_df.set_index(true_df.columns[0]) # Assuming Roll_Name is the first column
+    true_df.iloc[:, 0] = true_df.iloc[:, 0].astype(str).str.strip()
+    true_df = true_df.set_index(true_df.columns[0])
+    # Ensure column headers (dates) are string type for reliable key matching
+    true_df.columns = true_df.columns.astype(str).str.strip()
     
     name_map_df = pd.read_csv(name_mapping_path).dropna(subset=['Short_Name', 'Roll_Name'])
-    short_to_roll = dict(zip(name_map_df['Short_Name'].str.strip(), name_map_df['Roll_Name'].str.strip()))
+    # Filter out empty or whitespace-only rows
+    name_map_df = name_map_df[name_map_df['Short_Name'].astype(str).str.strip() != '']
+    short_to_roll = dict(zip(
+        name_map_df['Short_Name'].astype(str).str.strip(),
+        name_map_df['Roll_Name'].astype(str).str.strip()
+    ))
     
     protocol_map_df = pd.read_csv(protocol_mapping_path)
-    base_to_protocol = dict(zip(protocol_map_df['Base_Timestamp'].astype(str).str.strip(), protocol_map_df['Protocol_Length'].astype(str).str.strip()))
+    base_to_protocol = dict(zip(
+        protocol_map_df['Base_Timestamp'].astype(str).str.strip(),
+        protocol_map_df['Protocol_Length'].astype(str).str.strip()
+    ))
     
     # 3. Scan for video output CSVs
     file_pattern = os.path.join(input_dir, "*_output.csv")
@@ -64,16 +75,16 @@ def process_attendance(base_dir, target_folder):
         cam_dfs = [pd.read_csv(f) for f in session_files]
         merged_cams = pd.concat(cam_dfs, ignore_index=True)
         
-        # Map Short Names to Roll Names
-        merged_cams['Name'] = merged_cams['Name'].str.strip()
+        # Safely map Short Names to Roll Names
+        merged_cams['Name'] = merged_cams['Name'].astype(str).str.strip()
         merged_cams['Roll_Name'] = merged_cams['Name'].map(short_to_roll).fillna(merged_cams['Name'])
         
         # Determine logical Union (Present if ANY camera says Present)
-        merged_cams['Is_Present'] = merged_cams['Status'].str.strip().str.lower() == 'present'
+        merged_cams['Is_Present'] = merged_cams['Status'].astype(str).str.strip().str.lower() == 'present'
         
         grouped = merged_cams.groupby('Roll_Name').agg(
             Is_Present=('Is_Present', 'any'),
-            Detection_Count=('Detection Count', 'sum') # Sum the counts from both cams
+            Detection_Count=('Detection Count', 'sum')  # Sum counts from both cams
         ).reset_index()
         
         grouped['Estimated'] = grouped['Is_Present'].apply(lambda x: 'Present' if x else 'Absent')
@@ -114,10 +125,10 @@ def process_attendance(base_dir, target_folder):
         true_col = combined_df[(date_str, col_group, 'True')].astype(str).str.strip().str.lower()
         
         # Calculate matching accuracy
-        matches = (est_col == true_col) & (true_col != 'unknown') & (true_col != 'nan')
+        matches = (est_col == true_col) & (~true_col.isin(['unknown', 'nan', 'none', '']))
         student_matches += matches.astype(int)
         
-        valid_student_count = ((true_col != 'unknown') & (true_col != 'nan')).sum()
+        valid_student_count = (~true_col.isin(['unknown', 'nan', 'none', ''])).sum()
         date_accuracy = (matches.sum() / valid_student_count * 100) if valid_student_count > 0 else 0.0
         
         date_efficiencies[(date_str, col_group, 'Estimated')] = f"{date_accuracy:.2f}%"
@@ -151,7 +162,7 @@ def process_attendance(base_dir, target_folder):
     # Cleanup the Pandas 3-tier index export quirks
     ws['A1'] = 'Student Name & Roll No'
     ws.merge_cells('A1:A3')
-    ws.delete_rows(4) # Removes the blank row generated beneath the headers
+    ws.delete_rows(4)  # Removes the blank row generated beneath the headers
     
     max_row = ws.max_row
     max_col = ws.max_column
@@ -238,8 +249,7 @@ def process_attendance(base_dir, target_folder):
     print(f" -> {xlsx_output}")
 
 if __name__ == "__main__":
-    # Ensure this matches your file paths
     BASE_DIRECTORY = "ATTENDENCE RESULTS/Results"
-    TARGET_FOLDER = "test 1"
+    TARGET_FOLDER = "test 1"  # Update with your target test folder name
     
     process_attendance(BASE_DIRECTORY, TARGET_FOLDER)
