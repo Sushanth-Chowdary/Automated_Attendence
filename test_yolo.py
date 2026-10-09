@@ -227,7 +227,7 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
         yolo_model.predictor.trackers = None
 
     # Tune the confidence threshold based on on-screen percentages
-    CONFIDENCE_THRESHOLD = 0.78     
+    CONFIDENCE_THRESHOLD = 0.80     
     FRAME_SKIP = 1                  
     FRAMES_PER_VOTE = 5
 
@@ -303,7 +303,7 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
                     box_h = boxes[:, 3] - boxes[:, 1]
                     aspect_ratios = box_w / (box_h + 1e-6)
                     
-                    valid_mask = (box_w >= 65) & (box_h >= 65) & (aspect_ratios >= 0.55) & (aspect_ratios <= 1.55)
+                    valid_mask = (box_w >= 50) & (box_h >= 50) & (aspect_ratios >= 0.55) & (aspect_ratios <= 1.55)
                     
                     if valid_mask.any():
                         valid_boxes = boxes[valid_mask].clone()

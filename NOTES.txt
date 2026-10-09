@@ -2,7 +2,7 @@ clean the labels and add/remove data
 
 updating the true attendece csv file accordingly
 
-update the camera presets for a better angle  *****
+update the protocols in the next class
 ___________________________________________________________________________________________________________________________________________________________
 
 current latest pipelines on replacing anything
