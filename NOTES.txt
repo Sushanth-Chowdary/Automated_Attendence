@@ -1,6 +1,6 @@
 clean the labels and add/remove data
 
-name_mapping
+updating the true attendece csv file accordingly
 
 update the camera presets for a better angle  *****
 ___________________________________________________________________________________________________________________________________________________________
@@ -8,8 +8,6 @@ ________________________________________________________________________________
 current latest pipelines on replacing anything
 
 detection , clustering , recogniton - 1 each
-
-clustering first
 
 testing on the lab camera 
 

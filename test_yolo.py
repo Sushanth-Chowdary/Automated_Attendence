@@ -25,7 +25,6 @@ from facenet_pytorch import InceptionResnetV1
 
 from rich.live import Live
 from rich.table import Table
-from rich.progress import Progress, BarColumn, TextColumn
 
 # Suppress serialization warnings from third-party weights
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -85,10 +84,14 @@ def video_writer_worker(write_queue, output_path, fps, width, height):
         for i in range(len(ids_list)):
             box = boxes_cpu[i]
             t_id = ids_list[i]
-            name = names[i]
+            name, conf = names[i]
+            
             color = (0, 255, 0) if name not in ["Unknown", "Analyzing..."] else (0, 0, 255)
+            conf_str = f" {conf * 100:.1f}%" if conf > 0 else ""
+            label = f"ID:{t_id} {name}{conf_str}"
+            
             cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
-            cv2.putText(frame, f"ID:{t_id} {name}", (int(box[0]), int(box[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(frame, label, (int(box[0]), int(box[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             
         out.write(frame)
     out.release()
@@ -107,7 +110,7 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
     student_presence = {name: False for name in target_names}
     student_detection_count = {name: 0 for name in target_names}
 
-    for t_id, data in final_mem.items():
+    for t_id, data in sorted(final_mem.items(), key=lambda x: x[0]):
         total_frames = data.get('frames_alive', 0)
         all_preds = data['all_preds']
         valid_preds = [p for p in all_preds if p != "Unknown"]
@@ -145,7 +148,7 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
         })
 
     stem = os.path.splitext(video_filename)[0]
-    pd.DataFrame(debug_data).to_csv(os.path.join(output_dir, f"{stem}_DEBUG_Tracks.csv"))
+    pd.DataFrame(debug_data).to_csv(os.path.join(output_dir, f"{stem}_DEBUG_Tracks.csv"), index=False)
     
     output_data = [{'Name': s, 'Status': 'Present' if student_presence[s] else 'Absent', 'Detection Count': student_detection_count[s]} for s in target_names]
     pd.DataFrame(output_data).to_csv(os.path.join(output_dir, f"{stem}_output.csv"), index=False)
@@ -219,7 +222,12 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
         progress_q.put({"type": "skip", "file": video_filename})
         return video_filename, "Skipped"
 
-    CONFIDENCE_THRESHOLD = 0.79     
+    # Reset YOLO tracker state across videos to clear leftover trajectories
+    if hasattr(yolo_model, 'predictor') and yolo_model.predictor is not None:
+        yolo_model.predictor.trackers = None
+
+    # Tune the confidence threshold based on on-screen percentages
+    CONFIDENCE_THRESHOLD = 0.78     
     FRAME_SKIP = 1                  
     FRAMES_PER_VOTE = 5
 
@@ -236,10 +244,13 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
     writer_thread.daemon = True
     writer_thread.start()
     
+    # Video-local track ID mapping: guarantees every video starts cleanly at 1
+    local_id_counter = 0
+    raw_to_local_id = {}
+
     active_track_memory, archived_tracks, track_identities = {}, {}, {}
     frame_count = 0
     t_start = time.perf_counter()
-    last_q_time = t_start
 
     try:
         while video_stream.more():
@@ -260,15 +271,23 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
             has_detections = results[0].boxes.id is not None
             
             boxes_cpu = []
-            ids_list = []
+            local_ids_list = []
             frame_names = []
             
             if has_detections and ref_embeddings_tensor is not None:
                 boxes = results[0].boxes.xyxy.to(device) 
-                ids = results[0].boxes.id.to(device).int() 
+                raw_ids = results[0].boxes.id.to(device).int().cpu().tolist()
                 
-                ids_list = ids.cpu().tolist()
-                for t_id in ids_list:
+                # Map raw tracker IDs to local 1-based sequential IDs for this video
+                local_ids_list = []
+                for r_id in raw_ids:
+                    if r_id not in raw_to_local_id:
+                        local_id_counter += 1
+                        raw_to_local_id[r_id] = local_id_counter
+                    
+                    t_id = raw_to_local_id[r_id]
+                    local_ids_list.append(t_id)
+
                     if t_id not in active_track_memory:
                         active_track_memory[t_id] = {
                             'start_time': format_timestamp(frame_count, video_stream.fps),
@@ -288,7 +307,8 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
                     
                     if valid_mask.any():
                         valid_boxes = boxes[valid_mask].clone()
-                        valid_ids = ids[valid_mask]
+                        valid_mask_cpu = valid_mask.cpu().numpy()
+                        valid_local_ids = [local_ids_list[k] for k in range(len(local_ids_list)) if valid_mask_cpu[k]]
                         
                         margin_x = (valid_boxes[:, 2] - valid_boxes[:, 0]) * 0.15
                         margin_y = (valid_boxes[:, 3] - valid_boxes[:, 1]) * 0.15
@@ -304,8 +324,7 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
                         frame_tensor_chw = frame_tensor.permute(2, 0, 1).unsqueeze(0)
                         crops = ops.roi_align(frame_tensor_chw, roi_boxes, output_size=(160, 160)).detach()
                         
-                        valid_ids_list = valid_ids.cpu().tolist()
-                        for i, t_id in enumerate(valid_ids_list):
+                        for i, t_id in enumerate(valid_local_ids):
                             active_track_memory[t_id]['crop_buffer'].append(crops[i:i+1])
                             
                             if len(active_track_memory[t_id]['crop_buffer']) >= FRAMES_PER_VOTE:
@@ -343,24 +362,34 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
                                 indices_list = max_indices.cpu().tolist()
                                 
                                 for i, t_id in enumerate(valid_batch_track_ids):
-                                    name = target_names[y_real[indices_list[i]]] if sims_list[i] > CONFIDENCE_THRESHOLD else "Unknown"
-                                    active_track_memory[t_id]['buffer'].append(name)
+                                    conf_score = sims_list[i]
+                                    name = target_names[y_real[indices_list[i]]] if conf_score > CONFIDENCE_THRESHOLD else "Unknown"
+                                    
+                                    active_track_memory[t_id]['buffer'].append((name, conf_score))
                                     active_track_memory[t_id]['all_preds'].append(name)
                                     
                                     if len(active_track_memory[t_id]['buffer']) >= FRAMES_PER_VOTE:
-                                        valid_history = [v for v in active_track_memory[t_id]['all_preds'] if v != "Unknown"]
-                                        winner = Counter(valid_history).most_common(1)[0][0] if valid_history else "Unknown"
-                                        track_identities[t_id] = winner
+                                        valid_history = [v for v in active_track_memory[t_id]['buffer'] if v[0] != "Unknown"]
+                                        if valid_history:
+                                            counts = Counter([v[0] for v in valid_history])
+                                            winner = counts.most_common(1)[0][0]
+                                            winner_confs = [v[1] for v in valid_history if v[0] == winner]
+                                            avg_conf = sum(winner_confs) / len(winner_confs) if winner_confs else 0.0
+                                        else:
+                                            winner = "Unknown"
+                                            avg_conf = max([v[1] for v in active_track_memory[t_id]['buffer']]) if active_track_memory[t_id]['buffer'] else 0.0
+                                            
+                                        track_identities[t_id] = (winner, avg_conf)
                                         active_track_memory[t_id]['buffer'] = []
 
                 boxes_cpu = boxes.cpu().numpy()
-                for i in range(len(ids_list)):
-                    t_id = ids_list[i]
-                    frame_names.append(track_identities.get(t_id, "Analyzing..."))
+                for i in range(len(local_ids_list)):
+                    t_id = local_ids_list[i]
+                    frame_names.append(track_identities.get(t_id, ("Analyzing...", 0.0)))
                     
-            write_queue.put((frame, boxes_cpu, ids_list, frame_names))
+            write_queue.put((frame, boxes_cpu, local_ids_list, frame_names))
             
-            alive_ids = set(ids_list) if has_detections else set()
+            alive_ids = set(local_ids_list) if has_detections else set()
             for t_id in list(active_track_memory.keys()):
                 if t_id not in alive_ids:
                     active_track_memory[t_id]['missing_frames'] += 1
@@ -371,7 +400,6 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
 
             frame_count += 1
             
-            # Send status update every 10 frames to keep queue overhead negligible
             if frame_count % 10 == 0:
                 now = time.perf_counter()
                 elapsed = now - t_start
@@ -395,7 +423,7 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
         save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
         progress_q.put({"type": "finish", "file": video_filename})
 
-        del active_track_memory, archived_tracks, track_identities
+        del active_track_memory, archived_tracks, track_identities, raw_to_local_id
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -411,7 +439,6 @@ def run_live_dashboard(progress_q, total_videos, stop_event):
 
     with Live(auto_refresh=False, refresh_per_second=4) as live:
         while not stop_event.is_set() or not progress_q.empty():
-            # Flush queue messages
             while True:
                 try:
                     msg = progress_q.get_nowait()
@@ -435,7 +462,6 @@ def run_live_dashboard(progress_q, total_videos, stop_event):
                 except queue.Empty:
                     break
 
-            # Construct dynamic table
             table = Table(
                 title=f"[bold green]Batch Processing Progress ({completed}/{total_videos} Videos Finished)[/bold green]",
                 box=None
@@ -479,16 +505,13 @@ if __name__ == '__main__':
     total_files = len(target_videos)
     print(f"Found {total_files} video files in '{input_dir}'.")
     
-    # 6 parallel pipelines for RTX A4000
-    MAX_WORKERS = 6 
+    MAX_WORKERS = 9 
 
     if target_videos:
-        # Multiprocessing Manager Queue for telemetry updates
         manager = ctx.Manager()
         progress_q = manager.Queue()
         stop_event = threading.Event()
 
-        # Start background dashboard rendering thread
         dashboard_thread = threading.Thread(
             target=run_live_dashboard,
             args=(progress_q, total_files, stop_event),
