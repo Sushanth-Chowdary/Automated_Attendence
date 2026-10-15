@@ -1,8 +1,10 @@
-clean the labels and add/remove data
+update the protocols in the next class 
 
-updating the true attendece csv file accordingly
+train_mlp, test_mlp
 
-update the protocols in the next class
+acurracy to label size
+
+check the attedece of the low acxurate people
 ___________________________________________________________________________________________________________________________________________________________
 
 current latest pipelines on replacing anything

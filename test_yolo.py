@@ -505,7 +505,7 @@ if __name__ == '__main__':
     total_files = len(target_videos)
     print(f"Found {total_files} video files in '{input_dir}'.")
     
-    MAX_WORKERS = 9 
+    MAX_WORKERS = 10 
 
     if target_videos:
         manager = ctx.Manager()
