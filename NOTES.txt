@@ -1,10 +1,8 @@
 update the protocols in the next class 
 
-train_mlp, test_mlp
-
 acurracy to label size
 
-check the attedece of the low acxurate people
+check the attedece of the low acurate people
 ___________________________________________________________________________________________________________________________________________________________
 
 current latest pipelines on replacing anything
