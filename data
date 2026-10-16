@@ -1,1 +1,15 @@
+i want to create a sota model with this models below 
+- YOLO26-Face 
+- OC-SORT
+- GPU 5-Point Affine Warp ($112\times112$) + CR-FIQA / AdaFace Feature Norm ($\Vert{}f\Vert{}_2$)
+- AdaFace IResNet-50
+- Sub-Center / Centroid Gallery + Quality-Weighted EMA / Softmax Voting
+and the core logic and the path and directories and attecdece logic and  industry-grade multiprocessing backbone shouldnt be touched and tell the ai agent to not the change any original code 
 
+so give a prompt to tell a ai agent to create three files that are updated sota versions of test_yolo.py , train_yolo.py and main_gui.py (i will attach this three files to that ai agent) and it neeed to create new files that cover everthing that we discuseed and explain eevrthing that has to be done in that propmt clearly that we disucusseed above 
+
+and is it better to take the labels and make them 112*112 pixels with alignment and then save the labels and run the train  model or diretly run the train model as it will not make any much difference ?? 
+if yes we need runn and create new labels that have that 112*112 pixels and anth the 5 facial feature aligned write a script to do that 
+if no then make sure to do that in the train model and cover everthing as it  will not make that much differece 
+
+and besed on what we discussed use FAISS $k$-NN Graph + InfoMap (Overall SOTA) and update the Cluster_faces.py and give the full code (only write the code for the Cluster_faces.py other three will written by the ai agent ) 
