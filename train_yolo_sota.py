@@ -447,7 +447,7 @@ for person_name in os.listdir(dataset_path):
 
             label_id = name_to_label[person_name]
             df = pd.read_csv(csv_path)
-            class_embs = df.values.astype('float32')
+            class_embs = np.ascontiguousarray(df.values, dtype='float32')
             M = len(class_embs)
 
             if M == 0:

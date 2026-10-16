@@ -8,7 +8,6 @@ check the attedece and update of the low acurate people
 
 - Phase 1 to YOLO26-Face, GPU 5-Point Affine Alignment and AdaFace IResNet-50 
 - Phase 2 to FAISS KNN Graph + InfoMap clustering.
-
 ___________________________________________________________________________________________________________________________________________________________
 
 current latest pipelines on replacing anything
