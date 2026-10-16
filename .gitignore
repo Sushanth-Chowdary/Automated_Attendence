@@ -20,3 +20,4 @@ Results/
 *.npy
 .vscode
 *.yaml
+*.pth

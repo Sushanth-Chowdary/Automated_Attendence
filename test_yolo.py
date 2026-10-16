@@ -189,18 +189,17 @@ def init_worker():
         index = faiss.read_index(faiss_index_path)
         index.nprobe = 20
         try:
-            try:
-                ref_embeddings = index.reconstruct_n(0, index.ntotal)
-            except AttributeError:
-                index.make_direct_map()
-                ref_embeddings = np.array([index.reconstruct(i) for i in range(index.ntotal)])
-            
-            ref_embeddings_tensor = torch.from_numpy(ref_embeddings).to(device).float()
-            ref_embeddings_tensor = torch.nn.functional.normalize(ref_embeddings_tensor, p=2, dim=1)
-            if use_half:
-                ref_embeddings_tensor = ref_embeddings_tensor.half()
-        except Exception:
-            ref_embeddings_tensor = None
+            ref_embeddings = index.reconstruct_n(0, index.ntotal)
+        except AttributeError:
+            index.make_direct_map()
+            ref_embeddings = np.array([index.reconstruct(i) for i in range(index.ntotal)])
+        
+        ref_embeddings_tensor = torch.from_numpy(ref_embeddings).to(device).float()
+        ref_embeddings_tensor = torch.nn.functional.normalize(ref_embeddings_tensor, p=2, dim=1)
+        if use_half:
+            ref_embeddings_tensor = ref_embeddings_tensor.half()
+    else:
+        raise FileNotFoundError(f"FAISS index not found at {faiss_index_path}")
 
     # Load Metadata
     with open('./face_attendance_meta.pkl', 'rb') as f:
@@ -215,16 +214,19 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
     video_path = os.path.join(input_dir, video_filename)
     video_stem = os.path.splitext(video_filename)[0]
     output_csv = os.path.join(output_dir, f"{video_stem}_output.csv")
+    debug_csv = os.path.join(output_dir, f"{video_stem}_DEBUG_Tracks.csv")
     final_video_path = os.path.join(output_dir, f"{video_stem}_output.mp4")
 
-    # Resume capability: Skip if already finished
-    if os.path.exists(output_csv):
+    # Resume capability: Only skip if output_csv exists AND video file is non-empty
+    if os.path.exists(output_csv) and os.path.exists(final_video_path) and os.path.getsize(final_video_path) > 1024:
         progress_q.put({"type": "skip", "file": video_filename})
         return video_filename, "Skipped"
 
-    # Reset YOLO tracker state across videos to clear leftover trajectories
+    # PROPERLY Reset YOLO ByteTrack state across videos without setting attribute to None
     if hasattr(yolo_model, 'predictor') and yolo_model.predictor is not None:
-        yolo_model.predictor.trackers = None
+        if hasattr(yolo_model.predictor, 'trackers') and yolo_model.predictor.trackers:
+            for tracker in yolo_model.predictor.trackers:
+                tracker.reset()
 
     # Tune the confidence threshold based on on-screen percentages
     CONFIDENCE_THRESHOLD = 0.80     
@@ -251,6 +253,8 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
     active_track_memory, archived_tracks, track_identities = {}, {}, {}
     frame_count = 0
     t_start = time.perf_counter()
+    processing_succeeded = False
+    error_msg = None
 
     try:
         while video_stream.more():
@@ -412,16 +416,29 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
                     "fps": curr_fps
                 })
 
+        if frame_count > 0:
+            processing_succeeded = True
+
     except Exception as e:
-        progress_q.put({"type": "finish", "file": video_filename})
-        return video_filename, f"Error: {str(e)}"
+        error_msg = f"Error: {str(e)}"
+        return video_filename, error_msg
     finally:
         video_stream.stop()
         write_queue.put(None)
         writer_thread.join()  
         
-        save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
-        progress_q.put({"type": "finish", "file": video_filename})
+        if processing_succeeded:
+            save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
+            progress_q.put({"type": "finish", "file": video_filename})
+        else:
+            # Clean up broken/empty files if video crashed so resume doesn't skip it next time
+            for p in (final_video_path, output_csv, debug_csv):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            progress_q.put({"type": "error", "file": video_filename, "err": error_msg or "Unknown Crash"})
 
         del active_track_memory, archived_tracks, track_identities, raw_to_local_id
         gc.collect()
@@ -436,6 +453,8 @@ def run_live_dashboard(progress_q, total_videos, stop_event):
     """Renders a real-time console table displaying progress and FPS per video."""
     active_videos = {}
     completed = 0
+    failed = 0
+    last_error = ""
 
     with Live(auto_refresh=False, refresh_per_second=4) as live:
         while not stop_event.is_set() or not progress_q.empty():
@@ -459,11 +478,16 @@ def run_live_dashboard(progress_q, total_videos, stop_event):
                     elif msg_type in ("finish", "skip"):
                         active_videos.pop(filename, None)
                         completed += 1
+                    elif msg_type == "error":
+                        active_videos.pop(filename, None)
+                        failed += 1
+                        last_error = f"{filename}: {msg.get('err', '')}"
                 except queue.Empty:
                     break
 
+            err_str = f" | [bold red]Failed: {failed} ({last_error})[/bold red]" if failed > 0 else ""
             table = Table(
-                title=f"[bold green]Batch Processing Progress ({completed}/{total_videos} Videos Finished)[/bold green]",
+                title=f"[bold green]Batch Processing Progress ({completed}/{total_videos} Finished)[/bold green]{err_str}",
                 box=None
             )
             table.add_column("Running File", style="cyan", width=35, no_wrap=True)
@@ -505,7 +529,7 @@ if __name__ == '__main__':
     total_files = len(target_videos)
     print(f"Found {total_files} video files in '{input_dir}'.")
     
-    MAX_WORKERS = 10 
+    MAX_WORKERS = 6 
 
     if target_videos:
         manager = ctx.Manager()
@@ -518,6 +542,8 @@ if __name__ == '__main__':
             daemon=True
         )
         dashboard_thread.start()
+
+        errors_list = []
 
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=MAX_WORKERS, 
@@ -532,11 +558,18 @@ if __name__ == '__main__':
             for future in concurrent.futures.as_completed(futures):
                 video_filename = futures[future]
                 try:
-                    future.result()
+                    fname, status = future.result()
+                    if status.startswith("Error:"):
+                        errors_list.append((fname, status))
                 except Exception as exc:
-                    print(f"\n  -> [CRASH] {video_filename} error: {exc}")
+                    errors_list.append((video_filename, str(exc)))
 
         stop_event.set()
         dashboard_thread.join(timeout=1.0)
         
-        print("\nAll videos processed successfully.")
+        if errors_list:
+            print(f"\nCompleted with {len(errors_list)} errors:")
+            for fname, err in errors_list[:10]:
+                print(f"  -> [{fname}] {err}")
+        else:
+            print("\nAll videos processed successfully.")

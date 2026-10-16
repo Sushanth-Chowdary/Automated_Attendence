@@ -206,19 +206,19 @@ def init_worker():
         saved_data = pickle.load(f)
     target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
-    # Load MLP Model
+    # Load MLP Model (Keep in FP32 to avoid BatchNorm1d half-precision instability)
     mlp_model_path = './face_attendance_mlp.pth'
     mlp_model = None
     if os.path.exists(mlp_model_path):
-        checkpoint = torch.load(mlp_model_path, map_location=device)
+        checkpoint = torch.load(mlp_model_path, map_location=device, weights_only=False)
         input_dim = checkpoint.get('input_dim', 512)
         num_classes = checkpoint.get('num_classes', len(target_names))
         
-        mlp_model = FaceMLP(input_dim=input_dim, num_classes=num_classes).to(device)
+        mlp_model = FaceMLP(input_dim=input_dim, num_classes=num_classes).to(device).float()
         mlp_model.load_state_dict(checkpoint['model_state_dict'])
         mlp_model.eval()
-        if use_half:
-            mlp_model = mlp_model.half()
+    else:
+        raise FileNotFoundError(f"MLP checkpoint not found at {mlp_model_path}")
 
 
 def process_video(video_filename, input_dir, output_dir, progress_q):
@@ -228,16 +228,19 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
     video_path = os.path.join(input_dir, video_filename)
     video_stem = os.path.splitext(video_filename)[0]
     output_csv = os.path.join(output_dir, f"{video_stem}_output.csv")
+    debug_csv = os.path.join(output_dir, f"{video_stem}_DEBUG_Tracks.csv")
     final_video_path = os.path.join(output_dir, f"{video_stem}_output.mp4")
 
-    # Resume capability: Skip if already finished
-    if os.path.exists(output_csv):
+    # Resume capability: Only skip if output_csv exists AND video file is non-empty
+    if os.path.exists(output_csv) and os.path.exists(final_video_path) and os.path.getsize(final_video_path) > 1024:
         progress_q.put({"type": "skip", "file": video_filename})
         return video_filename, "Skipped"
 
-    # Reset YOLO tracker state across videos to clear leftover trajectories
+    # PROPERLY Reset YOLO ByteTrack state across videos without setting attribute to None
     if hasattr(yolo_model, 'predictor') and yolo_model.predictor is not None:
-        yolo_model.predictor.trackers = None
+        if hasattr(yolo_model.predictor, 'trackers') and yolo_model.predictor.trackers:
+            for tracker in yolo_model.predictor.trackers:
+                tracker.reset()
 
     # Tune the confidence threshold based on on-screen percentages
     CONFIDENCE_THRESHOLD = 0.80     
@@ -264,6 +267,8 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
     active_track_memory, archived_tracks, track_identities = {}, {}, {}
     frame_count = 0
     t_start = time.perf_counter()
+    processing_succeeded = False
+    error_msg = None
 
     try:
         while video_stream.more():
@@ -368,7 +373,8 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
                                 embeddings = resnet(valid_batch_tensor)
                                 embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
                                 
-                                logits = mlp_model(embeddings)
+                                # Run MLP in FP32 for numerical stability
+                                logits = mlp_model(embeddings.float())
                                 probs = torch.nn.functional.softmax(logits, dim=1)
                                 max_probs, max_indices = torch.max(probs, dim=1)
                                 
@@ -426,16 +432,29 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
                     "fps": curr_fps
                 })
 
+        if frame_count > 0:
+            processing_succeeded = True
+
     except Exception as e:
-        progress_q.put({"type": "finish", "file": video_filename})
-        return video_filename, f"Error: {str(e)}"
+        error_msg = f"Error: {str(e)}"
+        return video_filename, error_msg
     finally:
         video_stream.stop()
         write_queue.put(None)
         writer_thread.join()  
         
-        save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
-        progress_q.put({"type": "finish", "file": video_filename})
+        if processing_succeeded:
+            save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
+            progress_q.put({"type": "finish", "file": video_filename})
+        else:
+            # Clean up broken/empty files if video crashed so resume doesn't skip it next time
+            for p in (final_video_path, output_csv, debug_csv):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            progress_q.put({"type": "error", "file": video_filename, "err": error_msg or "Unknown Crash"})
 
         del active_track_memory, archived_tracks, track_identities, raw_to_local_id
         gc.collect()
@@ -450,6 +469,8 @@ def run_live_dashboard(progress_q, total_videos, stop_event):
     """Renders a real-time console table displaying progress and FPS per video."""
     active_videos = {}
     completed = 0
+    failed = 0
+    last_error = ""
 
     with Live(auto_refresh=False, refresh_per_second=4) as live:
         while not stop_event.is_set() or not progress_q.empty():
@@ -473,11 +494,16 @@ def run_live_dashboard(progress_q, total_videos, stop_event):
                     elif msg_type in ("finish", "skip"):
                         active_videos.pop(filename, None)
                         completed += 1
+                    elif msg_type == "error":
+                        active_videos.pop(filename, None)
+                        failed += 1
+                        last_error = f"{filename}: {msg.get('err', '')}"
                 except queue.Empty:
                     break
 
+            err_str = f" | [bold red]Failed: {failed} ({last_error})[/bold red]" if failed > 0 else ""
             table = Table(
-                title=f"[bold green]Batch Processing Progress ({completed}/{total_videos} Videos Finished)[/bold green]",
+                title=f"[bold green]Batch Processing Progress ({completed}/{total_videos} Finished)[/bold green]{err_str}",
                 box=None
             )
             table.add_column("Running File", style="cyan", width=35, no_wrap=True)
@@ -519,7 +545,7 @@ if __name__ == '__main__':
     total_files = len(target_videos)
     print(f"Found {total_files} video files in '{input_dir}'.")
     
-    MAX_WORKERS = 10 
+    MAX_WORKERS = 6 
 
     if target_videos:
         manager = ctx.Manager()
@@ -532,6 +558,8 @@ if __name__ == '__main__':
             daemon=True
         )
         dashboard_thread.start()
+
+        errors_list = []
 
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=MAX_WORKERS, 
@@ -546,11 +574,18 @@ if __name__ == '__main__':
             for future in concurrent.futures.as_completed(futures):
                 video_filename = futures[future]
                 try:
-                    future.result()
+                    fname, status = future.result()
+                    if status.startswith("Error:"):
+                        errors_list.append((fname, status))
                 except Exception as exc:
-                    print(f"\n  -> [CRASH] {video_filename} error: {exc}")
+                    errors_list.append((video_filename, str(exc)))
 
         stop_event.set()
         dashboard_thread.join(timeout=1.0)
         
-        print("\nAll videos processed successfully.")
+        if errors_list:
+            print(f"\nCompleted with {len(errors_list)} errors:")
+            for fname, err in errors_list[:10]:
+                print(f"  -> [{fname}] {err}")
+        else:
+            print("\nAll videos processed successfully.")
