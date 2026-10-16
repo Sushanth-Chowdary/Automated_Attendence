@@ -21,3 +21,4 @@ Results/
 .vscode
 *.yaml
 *.pth
+*.ckpt
