@@ -1,11 +1,14 @@
 check the attedece and update of the low acurate people
 
-create a new pilpline with sota models
 - YOLO26-Face 
 - OC-SORT
 - GPU 5-Point Affine Warp ($112\times112$) + CR-FIQA / AdaFace Feature Norm ($\Vert{}f\Vert{}_2$)
 - AdaFace IResNet-50
 - Sub-Center / Centroid Gallery + Quality-Weighted EMA / Softmax Voting
+
+- Phase 1 to YOLO26-Face, GPU 5-Point Affine Alignment and AdaFace IResNet-50 
+- Phase 2 to FAISS KNN Graph + InfoMap clustering.
+
 ___________________________________________________________________________________________________________________________________________________________
 
 current latest pipelines on replacing anything
