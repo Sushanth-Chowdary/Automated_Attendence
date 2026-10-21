@@ -8,6 +8,9 @@
 #   5. Sub-Center + Centroid gallery augmentation per class
 # =====================================================================
 
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # 1. Imports
 import torch
 import torch.nn as nn
@@ -15,7 +18,6 @@ import torch.nn.functional as F
 from ultralytics import YOLO
 import numpy as np
 import pandas as pd
-import os
 import cv2
 from collections import OrderedDict
 import pickle
@@ -150,70 +152,41 @@ ARCFACE_DST = torch.tensor([
     [70.7299, 92.2041]   # Right mouth corner
 ], dtype=torch.float32)
 
-
-def synthesize_5pt_from_boxes(boxes):
-    """
-    Synthesize 5 canonical facial keypoints from bounding boxes.
-    boxes: (N, 4) [x1, y1, x2, y2] tensor on GPU
-    Returns: (N, 5, 2) keypoints tensor float32
-    """
-    boxes = boxes.float()
-    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    w, h = x2 - x1, y2 - y1
-    kpts = torch.stack([
-        torch.stack([x1 + 0.34 * w, y1 + 0.40 * h], dim=-1),  # Left eye
-        torch.stack([x1 + 0.66 * w, y1 + 0.40 * h], dim=-1),  # Right eye
-        torch.stack([x1 + 0.50 * w, y1 + 0.58 * h], dim=-1),  # Nose tip
-        torch.stack([x1 + 0.37 * w, y1 + 0.76 * h], dim=-1),  # Left mouth
-        torch.stack([x1 + 0.63 * w, y1 + 0.76 * h], dim=-1),  # Right mouth
-    ], dim=1)  # (N, 5, 2)
-    return kpts.float()
+_dst_norm_const = (ARCFACE_DST / 111.0) * 2.0 - 1.0
+_X_const = torch.cat([_dst_norm_const, torch.ones((5, 1), dtype=torch.float32)], dim=1)
+ARCFACE_PINV = torch.linalg.pinv(_X_const).contiguous()  # (3, 5)
 
 
-def gpu_align_faces_112(frame_tensor_chw, keypoints_5pt, dst_template):
+def align_face_kpts_112(frame_tensor_chw, kpts, arcface_pinv, frame_h, frame_w, device):
     """
-    GPU vectorized 5-point affine warp to 112x112 in float32.
-    frame_tensor_chw: (1, 3, H, W) float32 BGR tensor on GPU
-    keypoints_5pt:    (N, 5, 2) float32 pixel coordinates on GPU
-    dst_template:     (5, 2) ARCFACE_DST on GPU
-    Returns:          (N, 3, 112, 112) aligned BGR float32 crops on GPU
+    Zero-expansion GPU 5-point affine warp to 112x112 in float32 using precomputed ARCFACE_PINV.
     """
-    N = keypoints_5pt.size(0)
+    N = kpts.size(0)
     if N == 0:
-        return torch.empty((0, 3, 112, 112), device=frame_tensor_chw.device, dtype=torch.float32)
+        return torch.empty((0, 3, 112, 112), device=device, dtype=torch.float32)
 
-    _, _, H, W = frame_tensor_chw.shape
-    frame_tensor_chw = frame_tensor_chw.float()
-    keypoints_5pt = keypoints_5pt.float()
-    dst_template = dst_template.float()
-
-    # Normalize source keypoints to [-1, 1]
     src_norm = torch.stack([
-        (keypoints_5pt[:, :, 0] / (W - 1.0)) * 2.0 - 1.0,
-        (keypoints_5pt[:, :, 1] / (H - 1.0)) * 2.0 - 1.0
-    ], dim=-1).float()  # (N, 5, 2)
-
-    # Normalize destination template to [-1, 1]
-    dst_pts = dst_template.unsqueeze(0).expand(N, -1, -1).float()
-    dst_norm = ((dst_pts / (112.0 - 1.0)) * 2.0 - 1.0).float()  # (N, 5, 2)
-
-    # Solve affine: X @ theta_T = src_norm, where X = [dst_norm, 1]
-    ones = torch.ones((N, 5, 1), device=keypoints_5pt.device, dtype=torch.float32)
-    X = torch.cat([dst_norm, ones], dim=2).float()  # (N, 5, 3)
-    theta_T = torch.linalg.lstsq(X, src_norm).solution.float()  # (N, 3, 2)
-    theta = theta_T.permute(0, 2, 1)  # (N, 2, 3)
-
-    expanded_frames = frame_tensor_chw.expand(N, -1, -1, -1)
+        (kpts[:, :, 0] / (frame_w - 1.0)) * 2.0 - 1.0,
+        (kpts[:, :, 1] / (frame_h - 1.0)) * 2.0 - 1.0
+    ], dim=-1)
+    pinv = arcface_pinv.to(device).float()
+    theta_T = torch.matmul(pinv.unsqueeze(0), src_norm)
+    theta = theta_T.permute(0, 2, 1).contiguous()
     grid = F.affine_grid(theta, size=(N, 3, 112, 112), align_corners=True)
-    crops_112 = F.grid_sample(expanded_frames, grid, mode='bilinear',
-                                padding_mode='zeros', align_corners=True)
-    return crops_112.detach().float()
+    sampled = F.grid_sample(
+        frame_tensor_chw,
+        grid.view(1, N * 112, 112, 2),
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=True
+    )
+    return sampled.squeeze(0).view(3, N, 112, 112).permute(1, 0, 2, 3).contiguous().detach()
 
 
 # ==========================================
 # NORM-BASED QUALITY THRESHOLD
 # ==========================================
-NORM_QUALITY_THRESHOLD = 10.0
+NORM_QUALITY_THRESHOLD = 6.0
 
 
 # ==========================================
@@ -227,9 +200,6 @@ resnet = load_adaface_model(device)
 
 dataset_path = './LABELS'
 BATCH_SIZE = 32
-
-# Move ARCFACE_DST to device
-arcface_dst = ARCFACE_DST.to(device)
 
 
 # ==========================================
@@ -247,8 +217,8 @@ for person_name in os.listdir(dataset_path):
         if num_images_in_folder == 0:
             continue
 
-        # Use _sota_embeddings.csv so old FaceNet CSVs don't cause Phase 1 to skip
-        csv_path = os.path.join(person_dir, f"{person_name}_sota_embeddings.csv")
+        # Use _sota_v2_embeddings.csv so previous runs are automatically recalculated
+        csv_path = os.path.join(person_dir, f"{person_name}_sota_v2_embeddings.csv")
         needs_processing = True
 
         if os.path.exists(csv_path):
@@ -278,50 +248,66 @@ for person_name in os.listdir(dataset_path):
 
                 h, w = img_cv2.shape[:2]
 
-                # Convert image to GPU tensor (BGR, float32)
-                img_tensor = torch.from_numpy(img_cv2).to(device).float()
-                img_chw = img_tensor.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
-
-                # Run YOLO on the image to get face box + keypoints
-                results = yolo_model(img_cv2, verbose=False)
-                boxes_xyxy = results[0].boxes.xyxy
-
-                if len(boxes_xyxy) == 0:
-                    # --- SMART BYPASS for 160x160 crops with no YOLO detection ---
-                    if h == 160 and w == 160:
-                        # Synthesize keypoints from inner 85% box [12, 12, 148, 148]
-                        fallback_box = torch.tensor([[12.0, 12.0, 148.0, 148.0]], device=device)
-                        kpts = synthesize_5pt_from_boxes(fallback_box)
+                if h == 160 and w == 160:
+                    results = yolo_model(img_cv2, verbose=False)
+                    has_real_kpts = (
+                        results[0].keypoints is not None and
+                        results[0].keypoints.xy is not None and
+                        results[0].keypoints.xy.numel() > 0 and
+                        results[0].keypoints.xy.shape[-2] >= 5 and
+                        (results[0].keypoints.xy.abs().sum() > 1.0).item()
+                    )
+                    if has_real_kpts:
+                        img_tensor = torch.from_numpy(img_cv2).to(device).float()
+                        img_chw = img_tensor.permute(2, 0, 1).unsqueeze(0)
+                        kpts = results[0].keypoints.xy.to(device).float()[0:1, :5, :]
+                        crop_112 = align_face_kpts_112(img_chw, kpts, ARCFACE_PINV, h, w, device)
+                        valid_face_tensors.append(crop_112)
                     else:
+                        # Direct resize from 160x160 to 112x112 preserving the exact 15% margin
+                        crop_112_cv = cv2.resize(img_cv2, (112, 112), interpolation=cv2.INTER_LINEAR)
+                        crop_112 = torch.from_numpy(crop_112_cv).permute(2, 0, 1).unsqueeze(0).to(device).float()
+                        valid_face_tensors.append(crop_112)
+                else:
+                    results = yolo_model(img_cv2, verbose=False)
+                    boxes_xyxy = results[0].boxes.xyxy
+                    if len(boxes_xyxy) == 0:
                         print(f"  -> No face detected in {image_name}, skipping.")
                         continue
-                else:
-                    boxes_gpu = boxes_xyxy.to(device).float()
 
-                    # Pick largest face
+                    has_real_kpts = (
+                        results[0].keypoints is not None and
+                        results[0].keypoints.xy is not None and
+                        results[0].keypoints.xy.numel() > 0 and
+                        results[0].keypoints.xy.shape[-2] >= 5 and
+                        (results[0].keypoints.xy.abs().sum() > 1.0).item()
+                    )
+
+                    boxes_gpu = boxes_xyxy.to(device).float()
                     areas = (boxes_gpu[:, 2] - boxes_gpu[:, 0]) * (boxes_gpu[:, 3] - boxes_gpu[:, 1])
                     largest_idx = torch.argmax(areas).item()
-                    best_box = boxes_gpu[largest_idx:largest_idx+1]  # (1, 4)
 
-                    # Try to get keypoints from YOLO
-                    has_kpts = (results[0].keypoints is not None and
-                                results[0].keypoints.xy is not None and
-                                results[0].keypoints.xy.numel() > 0)
-
-                    if has_kpts:
-                        all_kpts = results[0].keypoints.xy.to(device).float()  # (N, 5, 2)
-                        kpts = all_kpts[largest_idx:largest_idx+1]  # (1, 5, 2)
-
-                        # Validate: check for (0,0) keypoints
-                        kpts_valid = (kpts.abs().sum(dim=-1) > 1.0).all()
-                        if not kpts_valid:
-                            kpts = synthesize_5pt_from_boxes(best_box)
+                    if has_real_kpts:
+                        img_tensor = torch.from_numpy(img_cv2).to(device).float()
+                        img_chw = img_tensor.permute(2, 0, 1).unsqueeze(0)
+                        kpts = results[0].keypoints.xy.to(device).float()[largest_idx:largest_idx+1, :5, :]
+                        crop_112 = align_face_kpts_112(img_chw, kpts, ARCFACE_PINV, h, w, device)
+                        valid_face_tensors.append(crop_112)
                     else:
-                        kpts = synthesize_5pt_from_boxes(best_box)
-
-                # GPU affine warp to 112x112
-                crop_112 = gpu_align_faces_112(img_chw, kpts, arcface_dst)  # (1, 3, 112, 112)
-                valid_face_tensors.append(crop_112)
+                        best_box = boxes_gpu[largest_idx].cpu().numpy()
+                        bw = best_box[2] - best_box[0]
+                        bh = best_box[3] - best_box[1]
+                        margin_x = bw * 0.15
+                        margin_y = bh * 0.15
+                        x1 = max(0, int(round(best_box[0] - margin_x)))
+                        y1 = max(0, int(round(best_box[1] - margin_y)))
+                        x2 = min(w, int(round(best_box[2] + margin_x)))
+                        y2 = min(h, int(round(best_box[3] + margin_y)))
+                        face_crop = img_cv2[y1:y2, x1:x2]
+                        if face_crop.size > 0:
+                            crop_112_cv = cv2.resize(face_crop, (112, 112), interpolation=cv2.INTER_LINEAR)
+                            crop_112 = torch.from_numpy(crop_112_cv).permute(2, 0, 1).unsqueeze(0).to(device).float()
+                            valid_face_tensors.append(crop_112)
 
             except Exception as e:
                 print(f"  -> Failed on image {image_name}: {e}")
@@ -373,7 +359,7 @@ current_label_id = 0
 for person_name in os.listdir(dataset_path):
     person_dir = os.path.join(dataset_path, person_name)
     if os.path.isdir(person_dir):
-        csv_path = os.path.join(person_dir, f"{person_name}_sota_embeddings.csv")
+        csv_path = os.path.join(person_dir, f"{person_name}_sota_v2_embeddings.csv")
         if os.path.exists(csv_path):
             if person_name not in name_to_label:
                 name_to_label[person_name] = current_label_id
@@ -441,17 +427,24 @@ else:
     index = faiss.IndexFlatIP(embedding_dimension)
     index.add(X_real)
 
-faiss_index_path = './face_attendance_faiss.bin'
-faiss.write_index(index, faiss_index_path)
+# Save to BOTH face_attendance_sota_faiss.bin AND face_attendance_faiss.bin
+faiss_sota_path = './face_attendance_sota_faiss.bin'
+faiss_standard_path = './face_attendance_faiss.bin'
+faiss.write_index(index, faiss_sota_path)
+faiss.write_index(index, faiss_standard_path)
 
-metadata_path = './face_attendance_meta.pkl'
+meta_sota_path = './face_attendance_sota_meta.pkl'
+meta_standard_path = './face_attendance_meta.pkl'
 data_to_save = {
     'target_names': target_names,
     'y_real': y_real
 }
 
-with open(metadata_path, 'wb') as f:
+with open(meta_sota_path, 'wb') as f:
     pickle.dump(data_to_save, f)
 
-print(f"\nFAISS Index saved successfully to {faiss_index_path}")
+with open(meta_standard_path, 'wb') as f:
+    pickle.dump(data_to_save, f)
+
+print(f"\nFAISS Index saved successfully to {faiss_sota_path} and {faiss_standard_path}")
 print("Training Complete! Ready for testing.")

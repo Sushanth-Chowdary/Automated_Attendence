@@ -10,8 +10,10 @@
 #   7. Quality-Weighted Softmax Voting + EMA Tracklet Smoothing
 # ==============================================================================
 
-# 1. Imports
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# 1. Imports
 import gc
 import time
 import queue
@@ -33,6 +35,7 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.ops as ops
 from ultralytics import YOLO
 
 from rich.live import Live
@@ -285,21 +288,18 @@ def load_yolo_face(device, use_engine=False):
 OCSORT_TRACKER_PATH = "custom_ocsort.yaml"
 
 def ensure_ocsort_tracker():
-    """Create custom_ocsort.yaml if it doesn't exist."""
-    if not os.path.exists(OCSORT_TRACKER_PATH):
-        tracker_cfg = {
-            'tracker_type': 'botsort',
-            'track_high_thresh': 0.5,
-            'track_low_thresh': 0.1,
-            'new_track_thresh': 0.6,
-            'track_buffer': 50,
-            'match_thresh': 0.8,
-            'fuse_score': True,
-            'gmc_method': 'sparseOptFlow',
-            'with_reid': False,
-        }
-        with open(OCSORT_TRACKER_PATH, 'w') as f:
-            yaml.dump(tracker_cfg, f, default_flow_style=False)
+    """Create / overwrite custom_ocsort.yaml with ByteTrack tracker config."""
+    tracker_cfg = {
+        'tracker_type': 'bytetrack',
+        'track_high_thresh': 0.5,
+        'track_low_thresh': 0.1,
+        'new_track_thresh': 0.6,
+        'track_buffer': 50,
+        'match_thresh': 0.8,
+        'fuse_score': True,
+    }
+    with open(OCSORT_TRACKER_PATH, 'w') as f:
+        yaml.dump(tracker_cfg, f, default_flow_style=False)
 
 
 # ==========================================
@@ -313,89 +313,55 @@ ARCFACE_DST = torch.tensor([
     [70.7299, 92.2041]
 ], dtype=torch.float32)
 
+_dst_norm_const = (ARCFACE_DST / 111.0) * 2.0 - 1.0
+_X_const = torch.cat([_dst_norm_const, torch.ones((5, 1), dtype=torch.float32)], dim=1)
+ARCFACE_PINV = torch.linalg.pinv(_X_const).contiguous()  # (3, 5)
 
-def synthesize_5pt_from_boxes(boxes):
+
+def extract_faces_112(frame_tensor_chw, results, valid_mask, valid_boxes, arcface_pinv, frame_h, frame_w, device):
     """
-    Synthesize 5 canonical facial keypoints from bounding boxes.
-    boxes: (N, 4) [x1, y1, x2, y2] on GPU
-    Returns: (N, 5, 2) float32
+    - If YOLO model outputs real 5-point landmarks: performs zero-expansion GPU 5-point affine warp to 112x112.
+    - If YOLO model outputs boxes only (keypoints is None): performs GPU 15%-margin roi_align to 112x112
+      so crop geometry matches the 160x160 (15%-margin) training images in ./LABELS 100%!
     """
-    boxes = boxes.float()
-    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    w, h = x2 - x1, y2 - y1
-    kpts = torch.stack([
-        torch.stack([x1 + 0.34 * w, y1 + 0.40 * h], dim=-1),
-        torch.stack([x1 + 0.66 * w, y1 + 0.40 * h], dim=-1),
-        torch.stack([x1 + 0.50 * w, y1 + 0.58 * h], dim=-1),
-        torch.stack([x1 + 0.37 * w, y1 + 0.76 * h], dim=-1),
-        torch.stack([x1 + 0.63 * w, y1 + 0.76 * h], dim=-1),
-    ], dim=1)
-    return kpts.float()
+    has_real_kpts = (
+        results[0].keypoints is not None and
+        results[0].keypoints.xy is not None and
+        results[0].keypoints.xy.numel() > 0 and
+        results[0].keypoints.xy.shape[-2] >= 5 and
+        (results[0].keypoints.xy.abs().sum() > 1.0).item()
+    )
 
-
-def gpu_align_faces_112(frame_tensor_chw, keypoints_5pt, dst_template):
-    """
-    GPU vectorized 5-point affine warp to 112x112 in float32.
-    frame_tensor_chw: (1, 3, H, W) float32 BGR tensor on GPU
-    keypoints_5pt:    (N, 5, 2) float32 pixel coordinates on GPU
-    dst_template:     (5, 2) ARCFACE_DST on GPU
-    Returns:          (N, 3, 112, 112) aligned BGR float32 crops on GPU
-    """
-    N = keypoints_5pt.size(0)
-    if N == 0:
-        return torch.empty((0, 3, 112, 112), device=frame_tensor_chw.device, dtype=torch.float32)
-
-    _, _, H, W = frame_tensor_chw.shape
-    frame_tensor_chw = frame_tensor_chw.float()
-    keypoints_5pt = keypoints_5pt.float()
-    dst_template = dst_template.float()
-
-    src_norm = torch.stack([
-        (keypoints_5pt[:, :, 0] / (W - 1.0)) * 2.0 - 1.0,
-        (keypoints_5pt[:, :, 1] / (H - 1.0)) * 2.0 - 1.0
-    ], dim=-1).float()
-
-    dst_pts = dst_template.unsqueeze(0).expand(N, -1, -1).float()
-    dst_norm = ((dst_pts / (112.0 - 1.0)) * 2.0 - 1.0).float()
-
-    ones = torch.ones((N, 5, 1), device=keypoints_5pt.device, dtype=torch.float32)
-    X = torch.cat([dst_norm, ones], dim=2).float()
-    theta_T = torch.linalg.lstsq(X, src_norm).solution.float()
-    theta = theta_T.permute(0, 2, 1)
-
-    expanded_frames = frame_tensor_chw.expand(N, -1, -1, -1)
-    grid = F.affine_grid(theta, size=(N, 3, 112, 112), align_corners=True)
-    crops_112 = F.grid_sample(expanded_frames, grid, mode='bilinear',
-                                padding_mode='zeros', align_corners=True)
-    return crops_112.detach().float()
-
-
-def extract_keypoints_from_results(results, device):
-    """
-    Extract 5-point keypoints from YOLO results, with fallback synthesis.
-    Returns: (N, 5, 2) float32 tensor on device
-    """
-    boxes = results[0].boxes.xyxy.to(device).float()
-    N = boxes.size(0)
-    if N == 0:
-        return torch.empty((0, 5, 2), device=device, dtype=torch.float32)
-
-    has_kpts = (results[0].keypoints is not None and
-                results[0].keypoints.xy is not None and
-                results[0].keypoints.xy.numel() > 0)
-
-    if has_kpts:
-        kpts = results[0].keypoints.xy.to(device).float()  # (N, 5, 2)
-        kpts_magnitude = kpts.abs().sum(dim=-1)  # (N, 5)
-        invalid_mask = (kpts_magnitude < 1.0).any(dim=1)  # (N,)
-
-        if invalid_mask.any():
-            synth_kpts = synthesize_5pt_from_boxes(boxes)
-            kpts[invalid_mask] = synth_kpts[invalid_mask]
-
-        return kpts.float()
+    if has_real_kpts:
+        kpts = results[0].keypoints.xy.to(device).float()[valid_mask][:, :5, :]
+        N = kpts.size(0)
+        src_norm = torch.stack([
+            (kpts[:, :, 0] / (frame_w - 1.0)) * 2.0 - 1.0,
+            (kpts[:, :, 1] / (frame_h - 1.0)) * 2.0 - 1.0
+        ], dim=-1)
+        pinv = arcface_pinv.to(device).float()
+        theta_T = torch.matmul(pinv.unsqueeze(0), src_norm)
+        theta = theta_T.permute(0, 2, 1).contiguous()
+        grid = F.affine_grid(theta, size=(N, 3, 112, 112), align_corners=True)
+        sampled = F.grid_sample(
+            frame_tensor_chw,
+            grid.view(1, N * 112, 112, 2),
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True
+        )
+        return sampled.squeeze(0).view(3, N, 112, 112).permute(1, 0, 2, 3).contiguous().detach()
     else:
-        return synthesize_5pt_from_boxes(boxes).float()
+        boxes_m = valid_boxes.clone().float()
+        margin_x = (boxes_m[:, 2] - boxes_m[:, 0]) * 0.15
+        margin_y = (boxes_m[:, 3] - boxes_m[:, 1]) * 0.15
+        boxes_m[:, 0] = torch.clamp(boxes_m[:, 0] - margin_x, min=0.0)
+        boxes_m[:, 1] = torch.clamp(boxes_m[:, 1] - margin_y, min=0.0)
+        boxes_m[:, 2] = torch.clamp(boxes_m[:, 2] + margin_x, max=float(frame_w))
+        boxes_m[:, 3] = torch.clamp(boxes_m[:, 3] + margin_y, max=float(frame_h))
+        batch_idx = torch.zeros((boxes_m.size(0), 1), device=device, dtype=torch.float32)
+        roi_boxes = torch.cat((batch_idx, boxes_m), dim=1)
+        return ops.roi_align(frame_tensor_chw, roi_boxes, output_size=(112, 112)).detach()
 
 
 # ==========================================
@@ -403,25 +369,25 @@ def extract_keypoints_from_results(results, device):
 # ==========================================
 yolo_model = None
 resnet = None
-arcface_dst = None
 ref_embeddings_tensor = None
 target_names = []
 y_real = []
 device = None
 use_half = False
 
-CONFIDENCE_THRESHOLD = 0.48      # Recalibrated for AdaFace 512-D angular margin
+CONFIDENCE_THRESHOLD = 0.32      # Recalibrated for AdaFace 512-D angular margin
 FRAME_SKIP = 1
 FRAMES_PER_VOTE = 5
-NORM_QUALITY_THRESHOLD = 10.0
+NORM_QUALITY_THRESHOLD = 6.0
 EMA_MOMENTUM = 0.7
 SOFTMAX_TAU = 5.0
 
 
 def init_worker():
     """Initializes models once per worker process to prevent redundant reload overhead."""
-    global yolo_model, resnet, arcface_dst, ref_embeddings_tensor, target_names, y_real, device, use_half
+    global yolo_model, resnet, ref_embeddings_tensor, target_names, y_real, device, use_half
 
+    cv2.setNumThreads(1)
     time.sleep(random.uniform(0.2, 2.5))
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -432,10 +398,9 @@ def init_worker():
 
     # Load AdaFace IResNet-50
     resnet = load_adaface_model(device, use_half=use_half)
-    arcface_dst = ARCFACE_DST.to(device).float()
 
-    # Load FAISS Gallery
-    faiss_index_path = './face_attendance_faiss.bin'
+    # Load FAISS Gallery (SOTA index)
+    faiss_index_path = './face_attendance_sota_faiss.bin'
     ref_embeddings_tensor = None
     if os.path.exists(faiss_index_path):
         index = faiss.read_index(faiss_index_path)
@@ -451,10 +416,13 @@ def init_worker():
         if use_half:
             ref_embeddings_tensor = ref_embeddings_tensor.half()
     else:
-        raise FileNotFoundError(f"FAISS index not found at {faiss_index_path}")
+        raise FileNotFoundError("Please run 'python train_yolo_sota.py' first to build './face_attendance_sota_faiss.bin'!")
 
-    # Load Metadata
-    with open('./face_attendance_meta.pkl', 'rb') as f:
+    # Load Metadata (SOTA meta)
+    meta_path = './face_attendance_sota_meta.pkl'
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError("Please run 'python train_yolo_sota.py' first to build './face_attendance_sota_meta.pkl'!")
+    with open(meta_path, 'rb') as f:
         saved_data = pickle.load(f)
     target_names, y_real = saved_data['target_names'], saved_data['y_real']
 
@@ -509,8 +477,6 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
             if frame is None:
                 break
 
-            frame_tensor = torch.from_numpy(frame).to(device, non_blocking=True).float()
-
             results = yolo_model.track(
                 frame,
                 persist=True,
@@ -562,13 +528,19 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
                         valid_mask_cpu = valid_mask.cpu().numpy()
                         valid_local_ids = [local_ids_list[k] for k in range(len(local_ids_list)) if valid_mask_cpu[k]]
 
-                        # Extract 5-point keypoints with fallback synthesis
-                        all_kpts = extract_keypoints_from_results(results, device)
-                        valid_kpts = all_kpts[valid_mask]  # (Nvalid, 5, 2)
-
-                        # GPU affine warp to 112x112 in float32
-                        frame_tensor_chw = frame_tensor.permute(2, 0, 1).unsqueeze(0)
-                        crops = gpu_align_faces_112(frame_tensor_chw, valid_kpts, arcface_dst)  # (Nvalid, 3, 112, 112)
+                        frame_tensor_chw = (
+                            torch.from_numpy(frame)
+                            .to(device, non_blocking=True)
+                            .permute(2, 0, 1)
+                            .unsqueeze(0)
+                            .contiguous()
+                            .float()
+                        )
+                        crops = extract_faces_112(
+                            frame_tensor_chw, results, valid_mask, valid_boxes,
+                            ARCFACE_PINV, frame.shape[0], frame.shape[1], device
+                        )
+                        del frame_tensor_chw
 
                         for i, t_id in enumerate(valid_local_ids):
                             active_track_memory[t_id]['crop_buffer'].append(crops[i:i+1])
@@ -785,7 +757,7 @@ if __name__ == '__main__':
     total_files = len(target_videos)
     print(f"Found {total_files} video files in '{input_dir}'.")
 
-    MAX_WORKERS = 6
+    MAX_WORKERS = 4
 
     if target_videos:
         manager = ctx.Manager()
