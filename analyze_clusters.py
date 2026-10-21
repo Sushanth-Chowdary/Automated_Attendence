@@ -30,7 +30,8 @@ print(f"--- Phase 1: Loading Data from '{dataset_path}' ---")
 for person_name in sorted(os.listdir(dataset_path)): 
     person_dir = os.path.join(dataset_path, person_name)
     if os.path.isdir(person_dir):
-        csv_path = os.path.join(person_dir, f"{person_name}_sota_embeddings.csv")
+        # UPDATED: Now points to the latest aligned SOTA embeddings
+        csv_path = os.path.join(person_dir, f"{person_name}_sota_v2_embeddings.csv")
         
         if os.path.exists(csv_path):
             df = pd.read_csv(csv_path)
