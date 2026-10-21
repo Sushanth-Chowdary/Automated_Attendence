@@ -1,3 +1,5 @@
+update the issues in the gui
+
 check the attedece and update of the low acurate people
 
 - YOLO26-Face 
