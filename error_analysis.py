@@ -87,6 +87,6 @@ def generate_error_report(base_dir, target_folder):
 
 if __name__ == "__main__":
     BASE_DIRECTORY = "ATTENDENCE RESULTS/Results"
-    TARGET_FOLDER = "test 2" 
+    TARGET_FOLDER = "test 3" 
     
     generate_error_report(BASE_DIRECTORY, TARGET_FOLDER)

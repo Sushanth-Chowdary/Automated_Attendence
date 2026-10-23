@@ -1,4 +1,4 @@
-update the issues in the gui
+fix the variabel for better accuracy
 
 check the attedece and update of the low acurate people
 
