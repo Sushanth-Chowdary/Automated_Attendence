@@ -1,25 +1,22 @@
-# sweep_yolo_sota.py – Fast Feature-Cached Asynchronous Multi-Variable Sweep
+# sweep_yolo_sota.py – DGX 128-Core & GPU-0 Optimized Multi-Variable Sweep
 # ==============================================================================
 # Workflow:
-#   1. True Attendance Cache: Creates 'true_attendance_4videos.csv' in MINE/ once
-#      (skips automatically if already present).
-#   2. YOLO + AdaFace Feature Cache: Extracts per-track (frames_alive, box_w, box_h,
-#      512-D AdaFace embedding, feature_norm) once per video and saves to
-#      'ATTENDENCE RESULTS/MINE/feature_cache/<stem>_features.pt'.
-#      If the .pt cache files already exist, skips video reading & GPU inference!
-#   3. Asynchronous Multi-Variable Sweep (1,000+ combos):
-#      Asynchronously simulates each video per parameter combo from the cached
-#      embeddings -> writes temp_cXXXX_<video>_output.csv -> combines all 4 CSVs
-#      as soon as a combo's 4 videos finish -> records Overall Accuracy in
-#      'sweep_final_accuracy.csv' -> deletes the 4 temporary output.csv files.
-#   4. Visualization & Leaderboard: Generates 'sweep_visualization.png' and prints
-#      the top parameter combinations and optimal values.
+#   1. Locks GPU visibility strictly to GPU 0 (leaves GPU 7 & busy GPUs untouched).
+#   2. Prints Main Process ID (PID) at startup for SPCLAB-DGX_Utilization.xlsx.
+#   3. Uses 96 parallel CPU workers out of 128 cores for ultra-fast in-memory sweep.
+#   4. Writes real-time progress to 'live_status.txt' & 'sweep_progress.json'.
 # ==============================================================================
 
 import os
+# Strictly use GPU 0 only (avoids GPU 1, GPU 4, and reserved GPU 7)
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import gc
+import json
 import time
 import queue
 import random
@@ -51,12 +48,16 @@ from rich.live import Live
 from rich.table import Table
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import (
+    Progress, BarColumn, TextColumn, TimeRemainingColumn,
+    MofNCompleteColumn, SpinnerColumn
+)
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 console = Console()
 
 # ==========================================
-# 1. HARDCODED 4 VIDEOS & 1,944-COMBO SWEEP GRID
+# 1. HARDCODED 4 VIDEOS & SWEEP GRID
 # ==========================================
 SWEEP_VIDEOS = [
     "20260821_111106_cam1_raw.mp4",
@@ -65,8 +66,8 @@ SWEEP_VIDEOS = [
     "20260910_104345_cam2_raw.mp4",
 ]
 
-# Total combinations = 4 x 3 x 3 x 3 x 1 x 2 x 1 x 3 x 3 x 1 = 1,944 combinations
-# (7,776 video evaluations). Feel free to add/modify any values!
+# Total combinations = 4 x 3 x 3 x 3 x 1 x 2 x 3 x 3 x 3 x 3 = 5,832 combinations
+# (Change MIN_TOTAL_FRAMES to [45] if you want the 1,944-combo grid)
 SWEEP_GRID = {
     "CONFIDENCE_THRESHOLD":   [0.34, 0.37, 0.40, 0.43],
     "NORM_QUALITY_THRESHOLD": [5.5, 7.0, 8.5],
@@ -74,34 +75,37 @@ SWEEP_GRID = {
     "FRAMES_PER_VOTE":        [3, 5, 8],
     "SOFTMAX_TAU":            [5.0],
     "MIN_BOX_SIZE":           [50, 60],
-    "MIN_TOTAL_FRAMES":       [45],
+    "MIN_TOTAL_FRAMES":       [30, 45, 60],
     "MIN_TOTAL_SAMPLES":      [20, 30, 40],
     "MIN_SAMPLE_RATIO":       [0.25, 0.33, 0.40],
     "MIN_WIN_RATIO":          [0.45, 0.52, 0.60],
 }
 
-# The feature extractor captures all boxes >= BASE_MIN_BOX_SIZE so any MIN_BOX_SIZE >= 45
-# in SWEEP_GRID can be filtered dynamically without re-running the videos.
 BASE_MIN_BOX_SIZE = min(45, min(SWEEP_GRID["MIN_BOX_SIZE"]))
 
-INPUT_VIDEOS_DIR = "VIDEOS"
-RESULTS_BASE_DIR = "ATTENDENCE RESULTS/Results"
-MINE_OUTPUT_DIR = os.path.abspath("ATTENDENCE RESULTS/MINE")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INPUT_VIDEOS_DIR = os.path.join(BASE_DIR, "VIDEOS")
+
+if os.path.exists(os.path.join(BASE_DIR, "ATTENDENCE_RESULTS")):
+    ATTENDANCE_ROOT = os.path.join(BASE_DIR, "ATTENDENCE_RESULTS")
+else:
+    ATTENDANCE_ROOT = os.path.join(BASE_DIR, "ATTENDENCE RESULTS")
+
+RESULTS_BASE_DIR = os.path.join(ATTENDANCE_ROOT, "Results")
+MINE_OUTPUT_DIR = os.path.join(ATTENDANCE_ROOT, "MINE")
 FEATURE_CACHE_DIR = os.path.join(MINE_OUTPUT_DIR, "feature_cache")
 
-MAX_VIDEO_WORKERS = 4   # Parallel GPU workers for one-time feature extraction
-MAX_SWEEP_WORKERS = 8   # Parallel asynchronous workers for cached parameter sweep
+# On 128-core DGX, use 96 workers (leaves 32 cores free for OS & other users)
+CPU_COUNT = os.cpu_count() or 8
+MAX_VIDEO_WORKERS = 4
+MAX_SWEEP_WORKERS = min(96, max(8, CPU_COUNT - 32)) if CPU_COUNT >= 64 else max(8, CPU_COUNT - 2)
 FRAME_SKIP = 1
 
 
 # ==========================================
-# 2. TRUE ATTENDANCE CACHING & EVALUATION
+# 2. TRUE ATTENDANCE CACHING & LIVE PROGRESS WRITER
 # ==========================================
 def prepare_subset_true_attendance(sweep_videos, results_base_dir, mine_dir):
-    """
-    Creates (or loads if already present) true_attendance_4videos.csv inside MINE/
-    for the 4 hardcoded videos, plus the Short_Name -> Roll_Name dictionary.
-    """
     os.makedirs(mine_dir, exist_ok=True)
     subset_true_path = os.path.join(mine_dir, "true_attendance_4videos.csv")
     full_true_path = os.path.join(results_base_dir, "filtered_true_attendance.csv")
@@ -155,81 +159,54 @@ def prepare_subset_true_attendance(sweep_videos, results_base_dir, mine_dir):
     return true_df, short_to_roll
 
 
-def evaluate_combo_and_cleanup(combo_id, params, csv_file_map, true_df, short_to_roll):
-    """
-    Combines the 4 temporary output CSVs for a completed parameter combination,
-    calculates the exact union accuracy against true_df[cite: 1], and deletes the 4 CSVs.
-    """
-    sessions = {}
-    for video_name, csv_path in csv_file_map.items():
-        parts = video_name.split('_')
-        base_ts = f"{parts[0]}_{parts[1]}" if len(parts) >= 2 else video_name
-        sessions.setdefault(base_ts, []).append(csv_path)
-
-    total_matches = 0
-    total_valid = 0
-    tp = fp = tn = fn = 0
-
-    for ts, session_files in sorted(sessions.items()):
-        date_str = ts.split('_')[0]
-        if date_str not in true_df.columns:
-            continue
-
-        cam_dfs = [pd.read_csv(f) for f in session_files if os.path.exists(f)]
-        if not cam_dfs:
-            continue
-
-        merged_cams = pd.concat(cam_dfs, ignore_index=True)
-        merged_cams['Name'] = merged_cams['Name'].astype(str).str.strip()
-        merged_cams['Roll_Name'] = merged_cams['Name'].map(short_to_roll).fillna(merged_cams['Name'])
-        merged_cams['Is_Present'] = merged_cams['Status'].astype(str).str.strip().str.lower() == 'present'
-
-        grouped = merged_cams.groupby('Roll_Name').agg(
-            Is_Present=('Is_Present', 'any')
-        ).reset_index()
-        grouped['Estimated'] = grouped['Is_Present'].apply(lambda x: 'present' if x else 'absent')
-        grouped = grouped.set_index('Roll_Name')
-
-        grouped['True'] = true_df[date_str].reindex(grouped.index).fillna('')
-
-        est_col = grouped['Estimated'].astype(str).str.strip().str.lower()
-        true_col = grouped['True'].astype(str).str.strip().str.lower()
-
-        valid_mask = (~true_col.isin(['unknown', 'nan', 'none', ''])) & (true_col != '')
-        matches = (est_col == true_col) & valid_mask
-
-        total_matches += int(matches.sum())
-        total_valid += int(valid_mask.sum())
-
-        tp += int(((est_col == 'present') & (true_col == 'present') & valid_mask).sum())
-        tn += int(((est_col == 'absent') & (true_col == 'absent') & valid_mask).sum())
-        fp += int(((est_col == 'present') & (true_col == 'absent') & valid_mask).sum())
-        fn += int(((est_col == 'absent') & (true_col == 'present') & valid_mask).sum())
-
-    # Immediately delete the 4 temporary output.csv files for this combo
-    for csv_path in csv_file_map.values():
-        if os.path.exists(csv_path):
-            try:
-                os.remove(csv_path)
-            except OSError:
-                pass
-
-    overall_acc = (total_matches / total_valid * 100.0) if total_valid > 0 else 0.0
-    return {
-        "Combo_ID": combo_id,
-        **params,
-        "Overall_Accuracy": round(overall_acc, 4),
-        "Matches": total_matches,
-        "Total_Valid": total_valid,
-        "TP": tp,
-        "TN": tn,
-        "FP": fp,
-        "FN": fn,
+def write_live_progress(mine_dir, pid, completed, total, rate, elapsed_sec, eta_sec, best_acc, best_cid, best_params):
+    pct = (completed / total * 100.0) if total > 0 else 100.0
+    status_data = {
+        "pid": pid,
+        "gpu_device": 0,
+        "cpu_workers": MAX_SWEEP_WORKERS,
+        "completed_combos": completed,
+        "total_combos": total,
+        "percent": round(pct, 2),
+        "combos_per_sec": round(rate, 2),
+        "video_evals_per_sec": round(rate * len(SWEEP_VIDEOS), 2),
+        "elapsed_min": round(elapsed_sec / 60.0, 2),
+        "eta_min": round(eta_sec / 60.0, 2),
+        "best_accuracy": round(best_acc, 4),
+        "best_combo_id": best_cid,
+        "best_params": best_params,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
     }
+    json_path = os.path.join(mine_dir, "sweep_progress.json")
+    txt_path = os.path.join(mine_dir, "live_status.txt")
+
+    bar_len = 30
+    filled = int(bar_len * pct / 100.0)
+    bar_str = "█" * filled + "░" * (bar_len - filled)
+
+    txt_content = (
+        f"=================================================================\n"
+        f"🚀 DGX HYPERPARAMETER SWEEP LIVE MONITOR (Updated: {status_data['updated_at']})\n"
+        f"=================================================================\n"
+        f"PID      : {pid}  |  GPU: 0  |  CPU Workers: {MAX_SWEEP_WORKERS}\n"
+        f"Progress : [{bar_str}] {pct:6.2f}%\n"
+        f"Combos   : {completed:,} / {total:,} ({completed * len(SWEEP_VIDEOS):,} / {total * len(SWEEP_VIDEOS):,} Video Runs)\n"
+        f"Speed    : {rate:.1f} combos/sec  ({rate * len(SWEEP_VIDEOS):.1f} videos/sec)\n"
+        f"Elapsed  : {elapsed_sec/60.0:.1f} min  |  ETA Remaining: {eta_sec/60.0:.1f} min\n"
+        f"Best Acc : {best_acc:.2f}% (Combo #{best_cid})\n"
+        f"=================================================================\n"
+    )
+    try:
+        with open(json_path, "w") as f:
+            json.dump(status_data, f, indent=2)
+        with open(txt_path, "w") as f:
+            f.write(txt_content)
+    except OSError:
+        pass
 
 
 # ==========================================
-# 3. MODELS, ALIGNMENT & VIDEO READER
+# 3. MODELS, ALIGNMENT & VIDEO READER (STAGE 1)
 # ==========================================
 class ThreadedVideoReader:
     def __init__(self, path, queue_size=128):
@@ -329,8 +306,9 @@ class AdaFaceIResNet50(nn.Module):
 def load_adaface_model(device, use_half=False):
     model = AdaFaceIResNet50(embedding_size=512)
     for wf in ['adaface_ir50_webface4m.ckpt', 'adaface_ir50_webface4m.pth', 'adaface_ir50_webface4m.pt']:
-        if os.path.exists(wf):
-            ckpt = torch.load(wf, map_location='cpu', weights_only=False)
+        wf_path = os.path.join(BASE_DIR, wf) if not os.path.exists(wf) else wf
+        if os.path.exists(wf_path):
+            ckpt = torch.load(wf_path, map_location='cpu', weights_only=False)
             sd = ckpt.get('state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
             clean_sd = {}
             for k, v in sd.items():
@@ -348,14 +326,15 @@ def load_adaface_model(device, use_half=False):
 
 def load_yolo_face(device):
     for model_path in ['yolo26n-face.pt', 'yolov8n-face.pt']:
-        if os.path.exists(model_path):
-            model = YOLO(model_path, task='detect')
+        mp_full = os.path.join(BASE_DIR, model_path) if not os.path.exists(model_path) else model_path
+        if os.path.exists(mp_full):
+            model = YOLO(mp_full, task='detect')
             model.to(device)
             return model
     raise FileNotFoundError("No YOLO face model found!")
 
 
-OCSORT_TRACKER_PATH = "custom_ocsort.yaml"
+OCSORT_TRACKER_PATH = os.path.join(BASE_DIR, "custom_ocsort.yaml")
 
 
 def ensure_ocsort_tracker():
@@ -445,10 +424,6 @@ def init_extractor_worker():
 
 
 def extract_video_features_worker(video_filename, input_dir, cache_dir, progress_q):
-    """
-    Runs YOLO tracking + 5-point crop alignment + AdaFace embedding extraction ONCE
-    for a video and saves all per-track embeddings & box sizes to a .pt file[cite: 2].
-    """
     global ext_yolo_model, ext_resnet, ext_device, ext_use_half
 
     video_stem = os.path.splitext(video_filename)[0]
@@ -521,7 +496,6 @@ def extract_video_features_worker(video_filename, input_dir, cache_dir, progress
                     box_h = boxes[:, 3] - boxes[:, 1]
                     aspect_ratios = box_w / (box_h + 1e-6)
 
-                    # Extract all candidate faces down to BASE_MIN_BOX_SIZE
                     valid_mask = (
                         (box_w >= BASE_MIN_BOX_SIZE) &
                         (box_h >= BASE_MIN_BOX_SIZE) &
@@ -593,8 +567,8 @@ def extract_video_features_worker(video_filename, input_dir, cache_dir, progress
                     'frames_alive': data['frames_alive'],
                     'box_w': torch.tensor(data['box_w'], dtype=torch.float32),
                     'box_h': torch.tensor(data['box_h'], dtype=torch.float32),
-                    'embs': torch.cat(data['embs'], dim=0).half(),   # (M, 512) float16
-                    'norms': torch.cat(data['norms'], dim=0).float() # (M,) float32
+                    'embs': torch.cat(data['embs'], dim=0).half(),
+                    'norms': torch.cat(data['norms'], dim=0).float()
                 }
             else:
                 serialized_tracks[t_id] = {
@@ -681,9 +655,16 @@ def ensure_all_features_cached(sweep_videos, input_dir, cache_dir, ctx):
 
     if not missing_cache:
         console.print(f"[bold green]✔ All 4 YOLO+AdaFace feature cache files already exist in:[/bold green] {cache_dir}")
-        console.print("[bold green]  -> Skipping video decoding & GPU extraction! Jumping straight to 1,000+ parameter sweep.[/bold green]")
+        console.print("[bold green]  -> Skipping video decoding & GPU extraction! Jumping straight to Stage 2 parameter sweep.[/bold green]")
         return
 
+    missing_vids = [v for v in missing_cache if not os.path.exists(os.path.join(input_dir, v))]
+    if missing_vids:
+        raise FileNotFoundError(
+            f"Missing cache files for {missing_cache} in '{cache_dir}', and raw videos {missing_vids} not found in '{input_dir}'!"
+        )
+
+    ensure_ocsort_tracker()
     console.print(f"[bold yellow]⚙ Extracting YOLO+AdaFace embeddings for {len(missing_cache)} video(s) (One-Time Process)...[/bold yellow]")
     manager = ctx.Manager()
     progress_q = manager.Queue()
@@ -716,27 +697,27 @@ def ensure_all_features_cached(sweep_videos, input_dir, cache_dir, ctx):
 
 
 # ==========================================
-# 5. STAGE 2: ULTRA-FAST ASYNC SWEEP WORKER
+# 5. STAGE 2: ULTRA-FAST IN-MEMORY SWEEP WORKER
 # ==========================================
 sweep_cached_videos = {}
 sweep_ref_embeddings = None
 sweep_target_names = []
 sweep_y_real = []
-sweep_device = None
+sweep_short_to_roll = {}
+sweep_true_dict = {}
 
 
-def init_sweep_worker(sweep_videos, cache_dir):
-    """
-    Loads the 4 cached .pt feature files and the FAISS gallery into worker memory
-    once, so every (combo_id, video) task executes in milliseconds!
-    """
-    global sweep_cached_videos, sweep_ref_embeddings, sweep_target_names, sweep_y_real, sweep_device
+def init_sweep_worker(sweep_videos, cache_dir, base_dir, short_to_roll, true_dict):
+    global sweep_cached_videos, sweep_ref_embeddings, sweep_target_names, sweep_y_real
+    global sweep_short_to_roll, sweep_true_dict
 
-    sweep_device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    torch.set_num_threads(1)
+    sweep_short_to_roll = short_to_roll
+    sweep_true_dict = true_dict
 
-    faiss_index_path = './face_attendance_sota_faiss.bin'
+    faiss_index_path = os.path.join(base_dir, 'face_attendance_sota_faiss.bin')
     if not os.path.exists(faiss_index_path):
-        raise FileNotFoundError("Missing './face_attendance_sota_faiss.bin'!")
+        raise FileNotFoundError(f"Missing '{faiss_index_path}'!")
 
     index = faiss.read_index(faiss_index_path)
     index.nprobe = 20
@@ -746,10 +727,10 @@ def init_sweep_worker(sweep_videos, cache_dir):
         index.make_direct_map()
         ref_embeddings = np.array([index.reconstruct(i) for i in range(index.ntotal)])
 
-    sweep_ref_embeddings = torch.from_numpy(ref_embeddings).to(sweep_device).float()
+    sweep_ref_embeddings = torch.from_numpy(ref_embeddings).float()
     sweep_ref_embeddings = F.normalize(sweep_ref_embeddings, p=2, dim=1)
 
-    meta_path = './face_attendance_sota_meta.pkl'
+    meta_path = os.path.join(base_dir, 'face_attendance_sota_meta.pkl')
     with open(meta_path, 'rb') as f:
         saved_data = pickle.load(f)
     sweep_target_names, sweep_y_real = saved_data['target_names'], saved_data['y_real']
@@ -759,21 +740,16 @@ def init_sweep_worker(sweep_videos, cache_dir):
         stem = os.path.splitext(v)[0]
         cpath = os.path.join(cache_dir, f"{stem}_features.pt")
         tracks_data = torch.load(cpath, map_location='cpu', weights_only=False)
-        # Keep tensors in float32 on CPU/GPU for ultra-fast slicing
         for t_id, t_info in tracks_data.items():
             t_info['embs'] = t_info['embs'].float()
+            t_info['norms'] = t_info['norms'].float()
         sweep_cached_videos[v] = tracks_data
 
 
-def evaluate_cached_video_task(combo_id, params, video_filename, output_dir):
-    """
-    Replays the exact mathematical logic of test_yolo_sota.py for one video using
-    the cached embeddings, writes temp_cXXXX_<video>_output.csv, and returns[cite: 2].
-    """
-    global sweep_cached_videos, sweep_ref_embeddings, sweep_target_names, sweep_y_real, sweep_device
-
-    video_stem = os.path.splitext(video_filename)[0]
-    temp_output_csv = os.path.join(output_dir, f"temp_c{combo_id:04d}_{video_stem}_output.csv")
+def evaluate_combo_in_memory_task(task_tuple):
+    combo_id, params = task_tuple
+    global sweep_cached_videos, sweep_ref_embeddings, sweep_target_names, sweep_y_real
+    global sweep_short_to_roll, sweep_true_dict
 
     conf_thresh = params["CONFIDENCE_THRESHOLD"]
     norm_thresh = params["NORM_QUALITY_THRESHOLD"]
@@ -786,96 +762,124 @@ def evaluate_cached_video_task(combo_id, params, video_filename, output_dir):
     min_sample_ratio = params["MIN_SAMPLE_RATIO"]
     min_win_ratio = params["MIN_WIN_RATIO"]
 
-    tracks_data = sweep_cached_videos[video_filename]
-    student_presence = {name: False for name in sweep_target_names}
-    student_detection_count = {name: 0 for name in sweep_target_names}
+    sessions_presence = {}
 
     with torch.inference_mode():
-        for t_id, data in tracks_data.items():
-            total_frames = data['frames_alive']
-            if total_frames < min_total_frames or data['embs'].numel() == 0:
-                continue
+        for video_filename, tracks_data in sweep_cached_videos.items():
+            parts = video_filename.split('_')
+            date_str = parts[0]
+            if date_str not in sessions_presence:
+                sessions_presence[date_str] = {
+                    sweep_short_to_roll.get(name.strip(), name.strip()): False
+                    for name in sweep_target_names
+                }
 
-            # 1. Filter by MIN_BOX_SIZE
-            box_mask = (data['box_w'] >= min_box_size) & (data['box_h'] >= min_box_size)
-            if not box_mask.any():
-                continue
-
-            embs = data['embs'][box_mask]
-            norms = data['norms'][box_mask]
-            num_crops = embs.size(0)
-
-            # 2. Process in exact chunks of FRAMES_PER_VOTE (matching crop_buffer >= FRAMES_PER_VOTE)
-            num_full_windows = num_crops // frames_per_vote
-            if num_full_windows == 0:
-                continue
-
-            ema_emb = None
-            all_preds = []
-
-            for w_idx in range(num_full_windows):
-                start_i = w_idx * frames_per_vote
-                end_i = start_i + frames_per_vote
-
-                w_embs = embs[start_i:end_i]
-                w_norms = norms[start_i:end_i]
-
-                # 3. Quality gate: feature norm >= NORM_QUALITY_THRESHOLD
-                q_mask = w_norms >= norm_thresh
-                if not q_mask.any():
+            for t_id, data in tracks_data.items():
+                total_frames = data['frames_alive']
+                if total_frames < min_total_frames or data['embs'].numel() == 0:
                     continue
 
-                e_track = w_embs[q_mask].to(sweep_device)
-                n_track = w_norms[q_mask].to(sweep_device).unsqueeze(1)
-                K = e_track.size(0)
+                box_mask = (data['box_w'] >= min_box_size) & (data['box_h'] >= min_box_size)
+                if not box_mask.any():
+                    continue
 
-                # 4. Softmax quality weights & window embedding
-                weights = torch.softmax(n_track / softmax_tau, dim=0)
-                e_win = F.normalize(torch.sum(weights * e_track, dim=0, keepdim=True), p=2, dim=1)
+                embs = data['embs'][box_mask]
+                norms = data['norms'][box_mask]
+                num_crops = embs.size(0)
 
-                # 5. EMA tracklet smoothing
-                if ema_emb is None:
-                    ema_emb = e_win
+                num_full_windows = num_crops // frames_per_vote
+                if num_full_windows == 0:
+                    continue
+
+                ema_emb = None
+                all_preds = []
+
+                for w_idx in range(num_full_windows):
+                    start_i = w_idx * frames_per_vote
+                    end_i = start_i + frames_per_vote
+
+                    w_embs = embs[start_i:end_i]
+                    w_norms = norms[start_i:end_i]
+
+                    q_mask = w_norms >= norm_thresh
+                    if not q_mask.any():
+                        continue
+
+                    e_track = w_embs[q_mask]
+                    n_track = w_norms[q_mask].unsqueeze(1)
+                    K = e_track.size(0)
+
+                    weights = torch.softmax(n_track / softmax_tau, dim=0)
+                    e_win = F.normalize(torch.sum(weights * e_track, dim=0, keepdim=True), p=2, dim=1)
+
+                    if ema_emb is None:
+                        ema_emb = e_win
+                    else:
+                        ema_emb = F.normalize(ema_momentum * ema_emb + (1.0 - ema_momentum) * e_win, p=2, dim=1)
+
+                    sim_matrix = torch.mm(ema_emb, sweep_ref_embeddings.t())
+                    max_sim, max_idx = torch.max(sim_matrix, dim=1)
+                    conf_score = max_sim.item()
+                    winner = sweep_target_names[sweep_y_real[max_idx.item()]] if conf_score > conf_thresh else "Unknown"
+
+                    all_preds.extend([winner] * K)
+
+                valid_preds = [p for p in all_preds if p != "Unknown"]
+                valid_votes_count = len(valid_preds)
+                if valid_votes_count > 0:
+                    counts = Counter(valid_preds)
+                    winner = counts.most_common(1)[0][0]
+                    win_ratio = counts.get(winner, 0) / valid_votes_count
+                    total_samples = len(all_preds)
+                    sample_ratio = counts.get(winner, 0) / total_samples if total_samples > 0 else 0.0
+
+                    if (total_frames >= min_total_frames and
+                        total_samples >= min_total_samples and
+                        sample_ratio >= min_sample_ratio and
+                        win_ratio >= min_win_ratio):
+                        if winner != "Unknown":
+                            roll_name = sweep_short_to_roll.get(winner.strip(), winner.strip())
+                            sessions_presence[date_str][roll_name] = True
+
+    total_matches = 0
+    total_valid = 0
+    tp = fp = tn = fn = 0
+
+    for date_str, roll_pres_map in sorted(sessions_presence.items()):
+        if date_str not in sweep_true_dict:
+            continue
+        date_true_map = sweep_true_dict[date_str]
+
+        for roll_name, is_pres in roll_pres_map.items():
+            true_val = date_true_map.get(roll_name, '')
+            if true_val in ('unknown', 'nan', 'none', ''):
+                continue
+            total_valid += 1
+            est_val = 'present' if is_pres else 'absent'
+            if est_val == true_val:
+                total_matches += 1
+                if est_val == 'present':
+                    tp += 1
                 else:
-                    ema_emb = F.normalize(ema_momentum * ema_emb + (1.0 - ema_momentum) * e_win, p=2, dim=1)
+                    tn += 1
+            else:
+                if est_val == 'present':
+                    fp += 1
+                else:
+                    fn += 1
 
-                # 6. Cosine similarity against FAISS gallery
-                sim_matrix = torch.mm(ema_emb, sweep_ref_embeddings.t())
-                max_sim, max_idx = torch.max(sim_matrix, dim=1)
-                conf_score = max_sim.item()
-                winner = sweep_target_names[sweep_y_real[max_idx.item()]] if conf_score > conf_thresh else "Unknown"
-
-                all_preds.extend([winner] * K)
-
-            # 7. Track-level voting gate
-            valid_preds = [p for p in all_preds if p != "Unknown"]
-            valid_votes_count = len(valid_preds)
-            if valid_votes_count > 0:
-                counts = Counter(valid_preds)
-                winner = counts.most_common(1)[0][0]
-                win_ratio = counts.get(winner, 0) / valid_votes_count
-                total_samples = len(all_preds)
-                sample_ratio = counts.get(winner, 0) / total_samples if total_samples > 0 else 0.0
-
-                if (total_frames >= min_total_frames and
-                    total_samples >= min_total_samples and
-                    sample_ratio >= min_sample_ratio and
-                    win_ratio >= min_win_ratio):
-                    if winner != "Unknown":
-                        student_presence[winner] = True
-                        student_detection_count[winner] += counts.get(winner, 0)
-
-    # Save temporary output.csv for this video & combo
-    output_data = [
-        {
-            'Name': s,
-            'Status': 'Present' if student_presence[s] else 'Absent',
-            'Detection Count': student_detection_count[s]
-        }
-        for s in sweep_target_names
-    ]
-    pd.DataFrame(output_data).to_csv(temp_output_csv, index=False)
-    return combo_id, video_filename, temp_output_csv, "OK"
+    overall_acc = (total_matches / total_valid * 100.0) if total_valid > 0 else 0.0
+    return {
+        "Combo_ID": combo_id,
+        **params,
+        "Overall_Accuracy": round(overall_acc, 4),
+        "Matches": total_matches,
+        "Total_Valid": total_valid,
+        "TP": tp,
+        "TN": tn,
+        "FP": fp,
+        "FN": fn,
+    }
 
 
 # ==========================================
@@ -892,9 +896,8 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
 
     df_sorted = df.sort_values(by=["Overall_Accuracy", "TP"], ascending=[False, False]).reset_index(drop=True)
     best_row = df_sorted.iloc[0]
-    varied_keys = [k for k in param_keys if df[k].nunique() > 1]
+    varied_keys = [k for k in param_keys if k in df.columns and df[k].nunique() > 1]
 
-    # 1. Print Top 15 Leaderboard in Terminal
     leader_table = Table(title="[bold green]🏆 TOP 15 HYPERPARAMETER COMBINATIONS (OUT OF " + str(len(df)) + " TESTED)[/bold green]")
     leader_table.add_column("Rank", justify="center", style="bold yellow")
     leader_table.add_column("Combo ID", justify="center", style="cyan")
@@ -916,8 +919,7 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
     console.print("\n")
     console.print(leader_table)
 
-    # Best Parameters Summary Panel
-    best_params_str = "\n".join([f"  • [bold cyan]{k}[/bold cyan]: {best_row[k]}" for k in param_keys])
+    best_params_str = "\n".join([f"  • [bold cyan]{k}[/bold cyan]: {best_row[k]}" for k in param_keys if k in best_row])
     console.print(Panel(
         f"[bold green]Max Overall Accuracy Achieved: {best_row['Overall_Accuracy']:.2f}% (Combo #{int(best_row['Combo_ID'])})[/bold green]\n"
         f"[bold magenta]Confusion Breakdown:[/bold magenta] TP={int(best_row['TP'])}, TN={int(best_row['TN'])}, FP={int(best_row['FP'])}, FN={int(best_row['FN'])}\n\n"
@@ -926,14 +928,12 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
         expand=False
     ))
 
-    # 2. Generate Multi-Panel Visualization Chart
     fig = plt.figure(figsize=(18, 12), dpi=150)
     fig.suptitle(
         f"Hyperparameter Sweep Analysis ({len(df)} Combos across 4 Videos) — Best Accuracy: {best_row['Overall_Accuracy']:.2f}%",
         fontsize=16, fontweight='bold', y=0.98
     )
 
-    # Panel A: Top 12 Combinations Bar Chart
     ax1 = plt.subplot(2, 2, 1)
     top_n = df_sorted.head(12).iloc[::-1]
     labels = [f"Combo #{int(r['Combo_ID'])}" for _, r in top_n.iterrows()]
@@ -948,7 +948,6 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
         w = bar.get_width()
         ax1.text(w + 0.1, bar.get_y() + bar.get_height()/2, f"{w:.2f}%", va='center', fontsize=9, fontweight='bold')
 
-    # Panel B: 2D Heatmap of CONFIDENCE_THRESHOLD vs NORM_QUALITY_THRESHOLD
     ax2 = plt.subplot(2, 2, 2)
     if len(varied_keys) >= 2:
         p1, p2 = varied_keys[0], varied_keys[1]
@@ -970,7 +969,6 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
     else:
         ax2.text(0.5, 0.5, "Need >= 2 varied parameters for 2D Heatmap", ha="center", va="center")
 
-    # Panel C: Parameter Sensitivity Curves (Mean & Max Accuracy per Value)
     ax3 = plt.subplot(2, 1, 2)
     if varied_keys:
         x_positions, x_labels, mean_vals, max_vals, group_boundaries = [], [], [], [], []
@@ -1013,20 +1011,29 @@ def generate_visualizations_and_report(final_csv_path, output_dir, param_keys):
 # ==========================================
 if __name__ == '__main__':
     mp.freeze_support()
-    ensure_ocsort_tracker()
     ctx = mp.get_context('spawn')
+    main_pid = os.getpid()
 
-    # Verify the 4 hardcoded videos exist if feature cache isn't already built
-    missing_vids = [
-        v for v in SWEEP_VIDEOS
-        if not os.path.exists(os.path.join(FEATURE_CACHE_DIR, f"{os.path.splitext(v)[0]}_features.pt"))
-        and not os.path.exists(os.path.join(INPUT_VIDEOS_DIR, v))
-    ]
-    if missing_vids:
-        raise FileNotFoundError(f"Missing hardcoded videos in '{INPUT_VIDEOS_DIR}': {missing_vids}")
+    console.print(Panel(
+        f"[bold yellow]Main Process ID (PID) for Excel Sheet:[/bold yellow] [bold white]{main_pid}[/bold white]\n"
+        f"[bold cyan]Assigned GPU Device:[/bold cyan] GPU 0 (CUDA_VISIBLE_DEVICES='0')\n"
+        f"[bold green]Parallel CPU Workers:[/bold green] {MAX_SWEEP_WORKERS} / {CPU_COUNT} Cores\n"
+        f"[bold magenta]Working Directory:[/bold magenta] {BASE_DIR}",
+        title="⚡ DGX Utilization Info (Copy to SPCLAB-DGX_Utilization.xlsx)",
+        expand=False
+    ))
 
     # Step 1: Prepare or load cached True Attendance for the 4 videos in MINE/
     true_df, short_to_roll = prepare_subset_true_attendance(SWEEP_VIDEOS, RESULTS_BASE_DIR, MINE_OUTPUT_DIR)
+
+    true_dict = {}
+    for col in true_df.columns:
+        col_clean = str(col).strip()
+        if col_clean.isdigit():
+            true_dict[col_clean] = {
+                str(idx).strip(): str(val).strip().lower()
+                for idx, val in true_df[col].items()
+            }
 
     # Step 2: Build or verify one-time YOLO + AdaFace feature cache for the 4 videos
     ensure_all_features_cached(SWEEP_VIDEOS, INPUT_VIDEOS_DIR, FEATURE_CACHE_DIR, ctx)
@@ -1041,18 +1048,24 @@ if __name__ == '__main__':
 
     final_accuracy_csv = os.path.join(MINE_OUTPUT_DIR, "sweep_final_accuracy.csv")
 
-    # Resume support: skip combinations already saved in sweep_final_accuracy.csv
     completed_combo_ids = set()
+    best_acc_so_far = 0.0
+    best_cid_so_far = None
+    best_params_so_far = {}
+
     if os.path.exists(final_accuracy_csv):
         try:
             existing_res = pd.read_csv(final_accuracy_csv)
-            if "Combo_ID" in existing_res.columns:
+            if "Combo_ID" in existing_res.columns and not existing_res.empty:
                 completed_combo_ids = set(existing_res["Combo_ID"].astype(int).tolist())
-                if completed_combo_ids:
-                    console.print(
-                        f"[bold cyan]↻ Found {len(completed_combo_ids)} already-evaluated combinations in "
-                        f"{final_accuracy_csv}. Resuming remaining...[/bold cyan]"
-                    )
+                best_idx = existing_res["Overall_Accuracy"].idxmax()
+                best_row_init = existing_res.loc[best_idx]
+                best_acc_so_far = float(best_row_init["Overall_Accuracy"])
+                best_cid_so_far = int(best_row_init["Combo_ID"])
+                console.print(
+                    f"[bold cyan]↻ Found {len(completed_combo_ids)} already-evaluated combinations in "
+                    f"{final_accuracy_csv}. Resuming remaining...[/bold cyan]"
+                )
         except Exception:
             pass
 
@@ -1062,81 +1075,95 @@ if __name__ == '__main__':
         if (idx + 1) not in completed_combo_ids
     ]
 
-    total_combos = len(pending_combos)
-    total_video_runs = total_combos * len(SWEEP_VIDEOS)
+    total_all_combos = len(all_combos)
+    already_done_count = len(completed_combo_ids)
+    total_pending = len(pending_combos)
 
     if pending_combos:
         console.print(
-            f"\n[bold white]🚀 Stage 2: Launching Asynchronous Parameter Sweep:[/bold white] "
-            f"{total_combos} parameter combos × {len(SWEEP_VIDEOS)} videos = {total_video_runs} async video evaluations."
+            f"\n[bold white]🚀 Stage 2: Launching DGX Parameter Sweep ({MAX_SWEEP_WORKERS} Parallel CPU Workers):[/bold white]\n"
+            f"   {total_pending:,} parameter combos × {len(SWEEP_VIDEOS)} videos = {total_pending * len(SWEEP_VIDEOS):,} video evaluations."
         )
         t_sweep_start = time.perf_counter()
 
-        combo_params_lookup = {cid: p for cid, p in pending_combos}
-        combo_completed_csvs = {cid: {} for cid, _ in pending_combos}
-        completed_combos_count = 0
-        best_acc_so_far = 0.0
-        best_cid_so_far = None
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=38),
+            MofNCompleteColumn(),
+            TextColumn("[bold yellow]{task.percentage:>5.1f}%"),
+            TimeRemainingColumn(),
+            TextColumn("[bold green]{task.fields[speed]}"),
+            TextColumn("[bold magenta]{task.fields[best]}"),
+            console=console,
+            refresh_per_second=5
+        )
 
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=MAX_SWEEP_WORKERS,
-            mp_context=ctx,
-            initializer=init_sweep_worker,
-            initargs=(SWEEP_VIDEOS, FEATURE_CACHE_DIR)
-        ) as executor:
-            futures = {}
-            for combo_id, params in pending_combos:
-                for video_name in SWEEP_VIDEOS:
-                    fut = executor.submit(
-                        evaluate_cached_video_task,
-                        combo_id, params, video_name, MINE_OUTPUT_DIR
-                    )
-                    futures[fut] = (combo_id, video_name)
+        task_id = progress.add_task(
+            "Sweeping Combos",
+            total=total_all_combos,
+            completed=already_done_count,
+            speed="Starting 96 workers...",
+            best=f"Best: {best_acc_so_far:.2f}%" if best_cid_so_far else "Best: --"
+        )
 
-            with Live(auto_refresh=False, refresh_per_second=8) as live:
+        write_live_progress(
+            MINE_OUTPUT_DIR, main_pid, already_done_count, total_all_combos,
+            0.0, 0.0, 0.0, best_acc_so_far, best_cid_so_far, best_params_so_far
+        )
+
+        buffer_rows = []
+        completed_session = 0
+
+        with progress:
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=MAX_SWEEP_WORKERS,
+                mp_context=ctx,
+                initializer=init_sweep_worker,
+                initargs=(SWEEP_VIDEOS, FEATURE_CACHE_DIR, BASE_DIR, short_to_roll, true_dict)
+            ) as executor:
+                futures = {
+                    executor.submit(evaluate_combo_in_memory_task, item): item[0]
+                    for item in pending_combos
+                }
+
                 for fut in concurrent.futures.as_completed(futures):
-                    combo_id, video_name = futures[fut]
+                    combo_id = futures[fut]
                     try:
-                        cid, vname, csv_path, status = fut.result()
-                        if status == "OK" and csv_path:
-                            combo_completed_csvs[cid][vname] = csv_path
+                        row_result = fut.result()
+                        buffer_rows.append(row_result)
+                        completed_session += 1
+                        current_total_done = already_done_count + completed_session
 
-                            # As soon as all 4 videos for this combo finish:
-                            if len(combo_completed_csvs[cid]) == len(SWEEP_VIDEOS):
-                                row_result = evaluate_combo_and_cleanup(
-                                    cid,
-                                    combo_params_lookup[cid],
-                                    combo_completed_csvs[cid],
-                                    true_df,
-                                    short_to_roll
-                                )
-                                row_df = pd.DataFrame([row_result])
-                                write_header = not os.path.exists(final_accuracy_csv)
-                                row_df.to_csv(final_accuracy_csv, mode='a', header=write_header, index=False)
+                        acc = row_result["Overall_Accuracy"]
+                        if acc > best_acc_so_far:
+                            best_acc_so_far = acc
+                            best_cid_so_far = row_result["Combo_ID"]
+                            best_params_so_far = {k: row_result[k] for k in param_keys}
 
-                                completed_combos_count += 1
-                                acc = row_result["Overall_Accuracy"]
-                                if acc > best_acc_so_far:
-                                    best_acc_so_far = acc
-                                    best_cid_so_far = cid
+                        if len(buffer_rows) >= 50 or current_total_done == total_all_combos:
+                            df_chunk = pd.DataFrame(buffer_rows)
+                            write_header = not os.path.exists(final_accuracy_csv)
+                            df_chunk.to_csv(final_accuracy_csv, mode='a', header=write_header, index=False)
+                            buffer_rows.clear()
 
-                                del combo_completed_csvs[cid]
+                            elapsed = time.perf_counter() - t_sweep_start
+                            rate = completed_session / elapsed if elapsed > 0 else 0.0
+                            remaining_combos = total_all_combos - current_total_done
+                            eta_sec = remaining_combos / rate if rate > 0 else 0.0
 
-                                if completed_combos_count % 10 == 0 or completed_combos_count == total_combos:
-                                    elapsed = time.perf_counter() - t_sweep_start
-                                    rate = completed_combos_count / elapsed if elapsed > 0 else 0.0
-                                    status_tbl = Table(box=None)
-                                    status_tbl.add_column("Sweep Progress", style="bold cyan")
-                                    status_tbl.add_column("Speed", style="green")
-                                    status_tbl.add_column("Best Accuracy So Far", style="bold yellow")
-                                    status_tbl.add_row(
-                                        f"{completed_combos_count} / {total_combos} Combos ({completed_combos_count/total_combos*100:.1f}%)",
-                                        f"{rate:.1f} combos/sec",
-                                        f"{best_acc_so_far:.2f}% (Combo #{best_cid_so_far})"
-                                    )
-                                    live.update(status_tbl, refresh=True)
+                            progress.update(
+                                task_id,
+                                completed=current_total_done,
+                                speed=f"{rate:.1f} combos/s ({rate*len(SWEEP_VIDEOS):.0f} vids/s)",
+                                best=f"Best: {best_acc_so_far:.2f}% (#{best_cid_so_far})"
+                            )
+                            write_live_progress(
+                                MINE_OUTPUT_DIR, main_pid, current_total_done, total_all_combos,
+                                rate, elapsed, eta_sec, best_acc_so_far, best_cid_so_far, best_params_so_far
+                            )
                     except Exception as exc:
-                        console.print(f"[bold red]Error on Combo #{combo_id} ({video_name}): {exc}[/bold red]")
+                        console.print(f"[bold red]Error on Combo #{combo_id}: {exc}[/bold red]")
 
     # Step 4: Output Best Parameters, Leaderboard & Visualization Graphs
     generate_visualizations_and_report(final_accuracy_csv, MINE_OUTPUT_DIR, param_keys)
