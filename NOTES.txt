@@ -1,8 +1,10 @@
 check the attedece and update of the low acurate people
 
-update the ruslts in report 
-
 check the attedec of peple with constitent inaccuracy
+
+sohit
+
+
 ___________________________________________________________________________________________________________________________________________________________
 
 detection , clustering , recogniton - 1 each

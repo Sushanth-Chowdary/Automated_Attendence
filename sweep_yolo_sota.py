@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false
 # sweep_yolo_sota.py – DGX A100 GPU-Accelerated Hyperparameter Sweep (Stage 2)
 # ==============================================================================
 # Workflow:
@@ -33,26 +34,33 @@ import concurrent.futures
 import multiprocessing as mp
 
 import cv2
-import faiss
+import faiss  # type: ignore
 import yaml
 import numpy as np
 import pandas as pd
+
+# NumPy 2.x -> 1.x pickle compatibility shim
+import sys
+if 'numpy._core' not in sys.modules:
+    sys.modules['numpy._core'] = np.core
+    for _attr in dir(np.core):
+        sys.modules[f'numpy._core.{_attr}'] = getattr(np.core, _attr)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.ops as ops
-from ultralytics import YOLO
+from ultralytics import YOLO  # type: ignore
 
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from rich.live import Live
-from rich.table import Table
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import (
+from rich.live import Live  # type: ignore
+from rich.table import Table  # type: ignore
+from rich.console import Console  # type: ignore
+from rich.panel import Panel  # type: ignore
+from rich.progress import (  # type: ignore
     Progress, BarColumn, TextColumn, TimeRemainingColumn,
     MofNCompleteColumn, SpinnerColumn
 )
@@ -108,7 +116,6 @@ FRAME_SKIP = 1
 # How many parameter combos to evaluate in one GPU batch.
 # 256 is safe for an A100-80GB; lower to 128 if OOM occurs.
 GPU_BATCH_SIZE = 256
-
 
 # ==========================================
 # 2. TRUE ATTENDANCE CACHING & LIVE PROGRESS WRITER
@@ -882,15 +889,20 @@ def _eval_track_batch(
             a_conf_thresh_active = b_conf_thresh[act_idx]
             is_conf = (max_sim >= a_conf_thresh_active) & any_valid  # (A,)
 
-            for a_i in range(A):
-                a_totals[a_i] += 1
-                if is_conf[a_i].item():
-                    a_votes[a_i, pred_class[a_i]] += 1
+            # Vectorized vote accumulation (replaces slow Python for-loop)
+            a_totals += 1
+            if is_conf.any():
+                conf_indices = is_conf.nonzero(as_tuple=True)[0]  # indices where confident
+                conf_classes = pred_class[conf_indices]            # their predicted classes
+                a_votes.scatter_add_(
+                    1,
+                    conf_classes.unsqueeze(1),
+                    torch.ones(conf_indices.shape[0], 1, device=embs.device, dtype=torch.float32)
+                )
 
-        # Write back to global accumulators
-        for local_a, global_b in enumerate(act_idx.tolist()):
-            vote_counts[global_b] += a_votes[local_a]
-            total_preds[global_b] += a_totals[local_a]
+        # Vectorized write-back to global accumulators
+        vote_counts[act_idx] += a_votes
+        total_preds[act_idx] += a_totals
 
     return vote_counts, total_preds
 
