@@ -122,7 +122,6 @@ def process_daily_attendance(base_dir, target_folder):
     # 7. Apply Best Threshold and Build Final Pivot Table
     eval_df['Estimated'] = eval_df['Total_Count'].apply(lambda x: 'Present' if x >= best_threshold else 'Absent')
     
-    # Initialize the output DataFrame structure
     idx = pd.Index(all_students, name='Roll_Name')
     combined_df = pd.DataFrame(index=idx)
     bottom_summary_row = {}
@@ -133,7 +132,6 @@ def process_daily_attendance(base_dir, target_folder):
     for date_str in unique_dates:
         date_data = eval_df[eval_df['Date'] == date_str].set_index('Roll_Name')
         
-        # Populate columns
         count_series = date_data['Total_Count']
         est_series = date_data['Estimated']
         true_series = date_data['True_Label']
@@ -153,24 +151,44 @@ def process_daily_attendance(base_dir, target_folder):
         bottom_summary_row[(date_str, 'Total Count')] = ""
         bottom_summary_row[(date_str, 'True')] = ""
         
-        # Re-index to ensure all students are present in the final layout
         combined_df[(date_str, 'Total Count')] = count_series.reindex(idx).fillna(0).astype(int)
         combined_df[(date_str, 'Estimated')] = est_series.reindex(idx).fillna("")
         combined_df[(date_str, 'True')] = true_series.reindex(idx).fillna("")
 
-    # Add Overall Efficiency Column
-    combined_df.columns = pd.MultiIndex.from_tuples(combined_df.columns)
+    # --- ADD STUDENT-WISE ACCURACY ---
+    student_matches = pd.Series(0.0, index=combined_df.index)
+    student_valid = pd.Series(0.0, index=combined_df.index)
+
+    for date_str in unique_dates:
+        est_col = combined_df[(date_str, 'Estimated')]
+        true_col = combined_df[(date_str, 'True')]
+        
+        valid_mask = (true_col != "")
+        matches = (est_col == true_col) & valid_mask
+        
+        student_matches += matches.astype(int)
+        student_valid += valid_mask.astype(int)
+
+    student_acc = pd.Series(pd.NA, index=combined_df.index)
+    mask = student_valid > 0
+    student_acc[mask] = (student_matches[mask] / student_valid[mask]) * 100
     
+    combined_df[('Overall Summary', 'Student Accuracy')] = student_acc.apply(
+        lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A"
+    )
+
     overall_eff_val = f"{(total_matches_overall / total_possible_overall) * 100:.2f}%" if total_possible_overall > 0 else "N/A"
-    
-    # Transform Index to Combo Name
+    bottom_summary_row[('Overall Summary', 'Student Accuracy')] = overall_eff_val
+
+    # Structure Columns and Index
+    combined_df.columns = pd.MultiIndex.from_tuples(combined_df.columns)
     combined_df.index = combined_df.index.map(lambda x: roll_to_combo.get(str(x), str(x)))
     combined_df.index.name = 'Student Name & Roll No'
     combined_df = combined_df.sort_index()
     
     # Append Summary Row
     summary_df = pd.DataFrame([bottom_summary_row], index=['AVERAGE EFFICIENCY'])
-    summary_df.columns = combined_df.columns  # Align MultiIndex
+    summary_df.columns = combined_df.columns 
     combined_df = pd.concat([combined_df, summary_df])
 
     # 8. Save Files
@@ -205,7 +223,7 @@ def process_daily_attendance(base_dir, target_folder):
     thin_border = Border(left=Side(style='thin', color='BDC3C7'), right=Side(style='thin', color='BDC3C7'), 
                          top=Side(style='thin', color='BDC3C7'), bottom=Side(style='thin', color='BDC3C7'))
 
-    # Format Headers (Rows 1 and 2)
+    # Format Headers
     for row in range(1, 3):
         for cell in ws[row]:
             try:
@@ -215,6 +233,9 @@ def process_daily_attendance(base_dir, target_folder):
                 cell.border = thin_border
             except AttributeError:
                 pass
+                
+    # Merge the Overall Summary Header properly
+    ws.merge_cells(start_row=1, start_column=max_col, end_row=1, end_column=max_col)
 
     # Format Data Rows
     for row_idx in range(3, max_row):
@@ -233,6 +254,10 @@ def process_daily_attendance(base_dir, target_folder):
                 elif val == 'absent':
                     cell.fill = red_fill
                     cell.font = red_font
+                elif val.endswith('%') and val != 'n/a':
+                    if float(val.strip('%')) < 80.0:
+                        cell.fill = red_fill
+                        cell.font = red_font
             except (AttributeError, ValueError):
                 pass
 
@@ -274,7 +299,7 @@ def process_daily_attendance(base_dir, target_folder):
     # Adjust column widths
     for col_idx in range(1, max_col + 1):
         col_letter = get_column_letter(col_idx)
-        ws.column_dimensions[col_letter].width = 15
+        ws.column_dimensions[col_letter].width = 15 if col_idx < max_col else 20
     ws.column_dimensions['A'].width = 38
 
     ws.freeze_panes = "B3"
