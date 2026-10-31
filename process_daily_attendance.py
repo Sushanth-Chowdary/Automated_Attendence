@@ -311,6 +311,6 @@ def process_daily_attendance(base_dir, target_folder):
 
 if __name__ == "__main__":
     BASE_DIRECTORY = "ATTENDENCE RESULTS/Results"
-    TARGET_FOLDER = "test 7"  
+    TARGET_FOLDER = "test 8"  
     
     process_daily_attendance(BASE_DIRECTORY, TARGET_FOLDER)
