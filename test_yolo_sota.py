@@ -142,8 +142,8 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
 
             status = "Passed" if (total_frames >= 30 and
                                   total_samples >= 16 and
-                                  sample_ratio >= 0.40 and
-                                  win_ratio >= 0.39) else "Failed"
+                                  sample_ratio >= 0.3222 and
+                                  win_ratio >= 0.3604) else "Failed"
         else:
             winner = "Unknown"
             status = "Failed"
@@ -376,11 +376,11 @@ y_real = []
 device = None
 use_half = False
 
-CONFIDENCE_THRESHOLD = 0.38    
+CONFIDENCE_THRESHOLD = 0.4125    
 FRAME_SKIP = 1
-FRAMES_PER_VOTE = 2
+FRAMES_PER_VOTE = 4
 NORM_QUALITY_THRESHOLD = 7.0
-EMA_MOMENTUM = 0.8375
+EMA_MOMENTUM = 0.708
 SOFTMAX_TAU = 5.0
 
 
