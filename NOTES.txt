@@ -33,6 +33,78 @@ labels 245K samples
 151 videos , 20 days , 30 hours
 ___________________________________________________________________________________________________________________________________________________________
 
+4 videos seep -
+
+"CONFIDENCE_THRESHOLD": 0.4,
+
+"NORM_QUALITY_THRESHOLD": 7.0,
+
+"EMA_MOMENTUM": 0.85,
+
+"FRAMES_PER_VOTE": 3,
+
+"SOFTMAX_TAU": 5.0,
+
+"MIN_BOX_SIZE": 60,
+
+"MIN_TOTAL_FRAMES": 30,
+
+"MIN_TOTAL_SAMPLES": 20,
+
+"MIN_SAMPLE_RATIO": 0.4,
+
+"MIN_WIN_RATIO": 0.45
+
+accuracy - 94.8529
+
+testing the above with 151 videos we get 
+accuracy - 90.93
+by combining the protocols of the same day and puttig threshold 
+accuracy - 95.82
+
+151 videos  epoch sweep -
+
+"CONFIDENCE_THRESHOLD": 0.38,
+
+    "NORM_QUALITY_THRESHOLD": 7.0,
+
+    "EMA_MOMENTUM": 0.8375,
+
+    "FRAMES_PER_VOTE": 2,
+
+    "SOFTMAX_TAU": 5.0,
+
+    "MIN_BOX_SIZE": 50,
+
+    "MIN_TOTAL_FRAMES": 30,
+
+    "MIN_TOTAL_SAMPLES": 16,
+
+    "MIN_SAMPLE_RATIO": 0.4,
+
+    "MIN_WIN_RATIO": 0.39
+
+    accuracy - 91.48
+
+
+151 videos combined epoch sweep -
+
+    "CONFIDENCE_THRESHOLD": 0.4125,
+    "NORM_QUALITY_THRESHOLD": 7.0,
+    "EMA_MOMENTUM": 0.708,
+    "FRAMES_PER_VOTE": 4,
+    "SOFTMAX_TAU": 5.0,
+    "MIN_BOX_SIZE": 50.0,
+    "MIN_TOTAL_FRAMES": 30,
+    "MIN_TOTAL_SAMPLES": 16,
+    "MIN_SAMPLE_RATIO": 0.3222,
+    "MIN_WIN_RATIO": 0.3604
+
+      "best_accuracy": 96.7492,
+        5min: 88.71%  10min: 92.97%  15min: 93.25%  20min: 93.94%  30min: 97.06  Individual Session Accuracy: 91.67%  
+
+
+___________________________________________________________________________________________________________________________________________________________
 5 min-
 
 20260828_110647_cam2_raw.mp4
