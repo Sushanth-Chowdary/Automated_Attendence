@@ -13,12 +13,13 @@ import random
 # ==========================================
 dataset_path = './LABELS' 
 output_dir = './Below_80_Analysis'
-excel_path = 'Final_Report_With_Efficiency.xlsx'
-mapping_path = 'name_mapping.csv'
+excel_path = './Results/Final_Report_With_Efficiency.xlsx'
+mapping_path = './Results/name_mapping.csv'
 
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
 
+    
 # ==========================================
 # 1. Load Name Mapping 
 # ==========================================
