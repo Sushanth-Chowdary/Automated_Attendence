@@ -18,8 +18,7 @@ mapping_path = './Results/name_mapping.csv'
 
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
-
-    
+ 
 # ==========================================
 # 1. Load Name Mapping 
 # ==========================================
