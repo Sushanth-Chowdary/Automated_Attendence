@@ -1,3 +1,9 @@
+Gui update 
+
+All Agorthms in the process Attndece
+
+paranoma  , tsne plot 
+
 check the attedece and update of the low acurate people
 
 check the attedec of peple with constitent inaccuracy
@@ -23,7 +29,7 @@ train -
 - Phase 1 to YOLO26-Face, GPU 5-Point Affine Alignment and AdaFace IResNet-50 
 - Phase 2 to FAISS KNN Graph + InfoMap clustering.
 ___________________________________________________________________________________________________________________________________________________________
-
+12
 labels 245K samples
 
 219 videos , 28 days , 30 hours
