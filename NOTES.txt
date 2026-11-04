@@ -2,7 +2,7 @@ Gui update
 
 All Agorthms in the process Attndece
 
-paranoma  , tsne plot 
+paranoma 
 
 check the attedece and update of the low acurate people
 
