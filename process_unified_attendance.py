@@ -18,7 +18,7 @@ def load_reference_data(base_dir):
         if not os.path.exists(path):
             raise FileNotFoundError(f"Error: Could not find required file at {path}")
 
-    # 1. Load True Attendance and Create Roll + Name Combo
+    # 1. Load True Attendance
     true_df = pd.read_csv(true_attendance_path)
     roll_col = true_df.iloc[:, 0].astype(str).str.strip()
     name_col = true_df.iloc[:, 1].astype(str).str.strip()
@@ -26,6 +26,9 @@ def load_reference_data(base_dir):
     true_df['Combo_Name'] = roll_col + " - " + name_col
     roll_to_combo = dict(zip(roll_col, true_df['Combo_Name']))
     true_df = true_df.set_index(roll_col)
+    
+    # Prevent crashes if there are duplicate roll numbers in true_df
+    true_df = true_df[~true_df.index.duplicated(keep='first')]
 
     true_df.columns = true_df.columns.astype(str).str.strip().str.replace('-', '')
     for col in true_df.columns:
@@ -48,7 +51,7 @@ def load_reference_data(base_dir):
         protocol_map_df['Protocol_Length'].astype(str).str.strip()
     ))
 
-    # 4. Load Dataset Comparison (Label Sizes from same folder as name_mapping)
+    # 4. Load Dataset Comparison (Label Sizes)
     roll_to_labels = {}
     if os.path.exists(dataset_comp_path):
         comp_df = pd.read_csv(dataset_comp_path)
@@ -63,6 +66,14 @@ def load_reference_data(base_dir):
     else:
         print(f"Warning: {dataset_comp_path} not found. Label Size will be 'N/A'.")
 
+    # Safety: Guarantee ANY mapped roll number exists in roll_to_combo even if missing from true_df
+    for roll in short_to_roll.values():
+        if roll not in roll_to_combo:
+            roll_to_combo[roll] = str(roll)
+    for roll in roll_to_labels.keys():
+        if roll not in roll_to_combo:
+            roll_to_combo[roll] = str(roll)
+
     return true_df, roll_to_combo, short_to_roll, base_to_protocol, roll_to_labels
 
 
@@ -73,16 +84,9 @@ def is_cam1_file(filepath):
 
 
 # ==============================================================================
-# A1 & A3: PROTOCOL-WISE ATTENDANCE (EXACTLY LIKE process_attendance.py)
+# A1 & A3: PROTOCOL-WISE ATTENDANCE
 # ==============================================================================
 def run_protocol_attendance(output_files, true_df, roll_to_combo, short_to_roll, base_to_protocol, roll_to_labels, cam1_only=False):
-    """
-    A1 (cam1_only=False): Unions Cam1 + Cam2 for each protocol session on each day.
-    A3 (cam1_only=True) : Uses ONLY Cam1 for each protocol session on each day.
-    Columns per session : Estimated | Count | True
-    End columns         : 5 min Protocol | 10 min Protocol | 15 min Protocol | ... | Overall
-    """
-    # Filter files if A3 (cam1_only)
     selected_files = [f for f in output_files if is_cam1_file(f)] if cam1_only else list(output_files)
 
     sessions = {}
@@ -131,9 +135,12 @@ def run_protocol_attendance(output_files, true_df, roll_to_combo, short_to_roll,
         dfs.append(grouped)
 
     combined_df = pd.concat(dfs, axis=1)
-    idx = combined_df.index
+    
+    # Extract unique indices and ensure all known students are represented
+    all_students = sorted(list(roll_to_combo.keys()))
+    idx = pd.Index(all_students, name='Roll_Name')
+    combined_df = combined_df.reindex(idx)
 
-    # Insert Label Size column right at the start (Column B)
     label_col = ('Dataset', 'Comparison', 'Label Size')
     label_series = pd.Series([roll_to_labels.get(str(r), "N/A") for r in idx], index=idx)
     label_df = pd.DataFrame({label_col: label_series}, index=idx)
@@ -152,7 +159,6 @@ def run_protocol_attendance(output_files, true_df, roll_to_combo, short_to_roll,
     valid_lbls = [v for v in label_series if isinstance(v, (int, float))]
     bottom_summary_row[label_col] = f"Avg: {sum(valid_lbls)/len(valid_lbls):.0f}" if valid_lbls else "N/A"
 
-    # Calculate Efficiencies across sessions and protocols
     for ts in timestamps_ordered:
         date_str = ts.split('_')[0]
         protocol = base_to_protocol.get(ts, "Unknown Length")
@@ -163,8 +169,9 @@ def run_protocol_attendance(output_files, true_df, roll_to_combo, short_to_roll,
             protocol_student_matches[protocol] = pd.Series(0.0, index=idx)
             protocol_student_valid[protocol] = pd.Series(0.0, index=idx)
 
-        est_col = combined_df[(date_str, col_group, 'Estimated')].astype(str).str.strip().str.lower()
-        true_col = combined_df[(date_str, col_group, 'True')].astype(str).str.strip().str.lower()
+        # Handle NaNs from the reindex safely
+        est_col = combined_df[(date_str, col_group, 'Estimated')].fillna("Absent").astype(str).str.strip().str.lower()
+        true_col = combined_df[(date_str, col_group, 'True')].fillna("").astype(str).str.strip().str.lower()
 
         valid_mask = (~true_col.isin(['unknown', 'nan', 'none', ''])) & (true_col != '')
         matches = (est_col == true_col) & valid_mask
@@ -197,7 +204,6 @@ def run_protocol_attendance(output_files, true_df, roll_to_combo, short_to_roll,
     sorted_protocols = sorted(protocol_stats.keys(), key=sort_key)
     protocol_cols = []
 
-    # Add Protocol Efficiency Columns (5 min, 10 min, 15 min, 20 min, 30 min, etc.)
     for prot in sorted_protocols:
         col_name = (f'{prot} Protocol', 'Summary', 'Efficiency')
         protocol_cols.append((prot, col_name))
@@ -214,7 +220,6 @@ def run_protocol_attendance(output_files, true_df, roll_to_combo, short_to_roll,
         p_total = protocol_stats[prot]['total']
         bottom_summary_row[col_name] = f"{(p_matches / p_total) * 100:.2f}%" if p_total > 0 else "N/A"
 
-    # Add Overall Efficiency Column
     overall_col = ('Overall', 'Summary', 'Efficiency')
     mask_overall = overall_student_valid > 0
     overall_series = pd.Series(pd.NA, index=idx)
@@ -226,12 +231,10 @@ def run_protocol_attendance(output_files, true_df, roll_to_combo, short_to_roll,
 
     bottom_summary_row[overall_col] = f"{(total_matches_overall / total_possible_overall) * 100:.2f}%" if total_possible_overall > 0 else "N/A"
 
-    # Map Index to "Roll No - Student Name" and sort
     combined_df.index = combined_df.index.map(lambda x: roll_to_combo.get(str(x), str(x)))
     combined_df.index.name = 'Student Name & Roll No'
     combined_df = combined_df.sort_index()
 
-    # Append AVERAGE EFFICIENCY Row
     summary_df = pd.DataFrame([bottom_summary_row], index=['AVERAGE EFFICIENCY'])
     summary_df.columns = combined_df.columns
     combined_df = pd.concat([combined_df, summary_df])
@@ -245,15 +248,9 @@ def run_protocol_attendance(output_files, true_df, roll_to_combo, short_to_roll,
 
 
 # ==============================================================================
-# A2 & A4: DAILY COMBINED ATTENDANCE (EXACTLY LIKE process_daily_attendance.py)
+# A2 & A4: DAILY COMBINED ATTENDANCE
 # ==============================================================================
 def run_daily_attendance(output_files, true_df, roll_to_combo, short_to_roll, roll_to_labels, cam1_only=False):
-    """
-    A2 (cam1_only=False): Combines all protocols and both Cam1 + Cam2 for each full day.
-    A4 (cam1_only=True) : Combines all protocols from ONLY Cam1 for each full day.
-    Columns per date    : Total Count | Estimated | True
-    End column          : Overall Summary -> Student Accuracy
-    """
     selected_files = [f for f in output_files if is_cam1_file(f)] if cam1_only else list(output_files)
     if not selected_files:
         return pd.DataFrame(), {}
@@ -278,13 +275,16 @@ def run_daily_attendance(output_files, true_df, roll_to_combo, short_to_roll, ro
     all_students = sorted(list(roll_to_combo.keys()))
 
     for date_str in unique_dates:
-        if date_str not in true_df.columns:
-            continue
         for roll in all_students:
-            true_status_raw = true_df.at[roll, date_str].lower() if roll in true_df.index else ""
-            if true_status_raw in ['nan', 'unknown', 'none', '']:
-                continue
+            # Safely fetch true status to prevent missing data glitches
+            if date_str in true_df.columns and roll in true_df.index:
+                true_status_raw = str(true_df.at[roll, date_str]).strip().lower()
+            else:
+                true_status_raw = ""
+                
+            is_valid = true_status_raw not in ['nan', 'unknown', 'none', '']
             true_is_present = (true_status_raw == 'present')
+            
             student_match = daily_counts[(daily_counts['Date'] == date_str) & (daily_counts['Roll_Name'] == roll)]
             count = student_match['Detection Count'].values[0] if not student_match.empty else 0
 
@@ -293,25 +293,29 @@ def run_daily_attendance(output_files, true_df, roll_to_combo, short_to_roll, ro
                 'Roll_Name': roll,
                 'Total_Count': count,
                 'True_Present': true_is_present,
-                'True_Label': 'Present' if true_is_present else 'Absent'
+                'True_Label': 'Present' if true_is_present else ('Absent' if is_valid else ''),
+                'Is_Valid_True': is_valid
             })
 
     eval_df = pd.DataFrame(eval_records)
     if eval_df.empty:
         return pd.DataFrame(), {}
 
-    # Dynamically Find Best Threshold (Testing 1 through 20)
+    # Calculate optimal threshold ignoring students with missing true attendance
     best_threshold = 1
     best_accuracy = 0.0
-    for t in range(1, 21):
-        eval_df['Est_Present'] = eval_df['Total_Count'] >= t
-        accuracy = (eval_df['Est_Present'] == eval_df['True_Present']).mean() * 100
-        if accuracy > best_accuracy:
-            best_accuracy = accuracy
-            best_threshold = t
+    valid_eval_df = eval_df[eval_df['Is_Valid_True']]
+    
+    if not valid_eval_df.empty:
+        for t in range(1, 21):
+            est_present = valid_eval_df['Total_Count'] >= t
+            acc = (est_present == valid_eval_df['True_Present']).mean() * 100
+            if acc > best_accuracy:
+                best_accuracy = acc
+                best_threshold = t
 
     tag = "A4 (Cam1 Only Daily)" if cam1_only else "A2 (All Cams Daily)"
-    print(f"[{tag}] Optimal Threshold Found: {best_threshold} total detections/day (Overall Accuracy: {best_accuracy:.2f}%)")
+    print(f"[{tag}] Optimal Threshold Found: >= {best_threshold} total detections/day (Overall Accuracy: {best_accuracy:.2f}%)")
 
     eval_df['Estimated'] = eval_df['Total_Count'].apply(lambda x: 'Present' if x >= best_threshold else 'Absent')
 
@@ -319,7 +323,6 @@ def run_daily_attendance(output_files, true_df, roll_to_combo, short_to_roll, ro
     combined_df = pd.DataFrame(index=idx)
     bottom_summary_row = {}
 
-    # Insert Label Size Column First (Column B)
     label_col = ('Dataset', 'Label Size')
     combined_df[label_col] = [roll_to_labels.get(str(r), "N/A") for r in idx]
     valid_lbls = [v for v in combined_df[label_col] if isinstance(v, (int, float))]
@@ -335,8 +338,10 @@ def run_daily_attendance(output_files, true_df, roll_to_combo, short_to_roll, ro
         est_series = date_data['Estimated']
         true_series = date_data['True_Label']
 
-        matches = (date_data['Estimated'] == date_data['True_Label']).sum()
-        total = len(date_data)
+        # only count matches where ground truth is valid
+        valid_date_data = date_data[date_data['Is_Valid_True']]
+        matches = (valid_date_data['Estimated'] == valid_date_data['True_Label']).sum()
+        total = len(valid_date_data)
 
         if total > 0:
             date_eff = (matches / total) * 100
@@ -346,7 +351,6 @@ def run_daily_attendance(output_files, true_df, roll_to_combo, short_to_roll, ro
         else:
             eff_str = "N/A"
 
-        # Put date_eff in the first column of the 3-column block ('Total Count') so when merged in Excel it stays visible
         bottom_summary_row[(date_str, 'Total Count')] = eff_str
         bottom_summary_row[(date_str, 'Estimated')] = ""
         bottom_summary_row[(date_str, 'True')] = ""
@@ -355,7 +359,6 @@ def run_daily_attendance(output_files, true_df, roll_to_combo, short_to_roll, ro
         combined_df[(date_str, 'Estimated')] = est_series.reindex(idx).fillna("")
         combined_df[(date_str, 'True')] = true_series.reindex(idx).fillna("")
 
-    # Student-wise Accuracy
     student_matches = pd.Series(0.0, index=combined_df.index)
     student_valid = pd.Series(0.0, index=combined_df.index)
 
@@ -363,7 +366,8 @@ def run_daily_attendance(output_files, true_df, roll_to_combo, short_to_roll, ro
         est_col = combined_df[(date_str, 'Estimated')]
         true_col = combined_df[(date_str, 'True')]
 
-        valid_mask = (true_col != "")
+        # Prevent empty strings from breaking mask
+        valid_mask = (~true_col.str.lower().isin(['unknown', 'nan', 'none', ''])) & (true_col != "")
         matches = (est_col == true_col) & valid_mask
 
         student_matches += matches.astype(int)
@@ -398,10 +402,9 @@ def run_daily_attendance(output_files, true_df, roll_to_combo, short_to_roll, ro
 
 
 # ==============================================================================
-# EXCEL FORMATTING FUNCTIONS (EXACTLY MATCHING YOUR ORIGINAL SCRIPTS)
+# EXCEL FORMATTING FUNCTIONS
 # ==============================================================================
 def format_protocol_sheet(ws, num_sessions):
-    """Formats A1 and A3 exactly like process_attendance.py."""
     ws['A1'] = 'Student Name & Roll No'
     ws.merge_cells('A1:A3')
     ws.delete_rows(4)
@@ -449,9 +452,12 @@ def format_protocol_sheet(ws, num_sessions):
                     cell.fill = red_fill
                     cell.font = red_font
                 elif val.endswith('%') and val != 'n/a':
-                    if float(val.strip('%')) < 80.0:
-                        cell.fill = red_fill
-                        cell.font = red_font
+                    try:
+                        if float(val.strip('%')) < 80.0:
+                            cell.fill = red_fill
+                            cell.font = red_font
+                    except ValueError:
+                        pass
             except (AttributeError, ValueError):
                 pass
 
@@ -464,14 +470,15 @@ def format_protocol_sheet(ws, num_sessions):
 
             val = str(cell.value).strip().lower()
             if val.endswith('%') and val != 'n/a':
-                if float(val.strip('%')) < 80.0:
-                    cell.fill = red_fill
-                    cell.font = Font(color="9C0006", bold=True)
+                try:
+                    if float(val.strip('%')) < 80.0:
+                        cell.fill = red_fill
+                        cell.font = Font(color="9C0006", bold=True)
+                except ValueError:
+                    pass
         except (AttributeError, ValueError):
             pass
 
-    # Merge Estimated, Count, True columns for each session in the bottom summary row
-    # (Col 1 = Student Name, Col 2 = Label Size, so sessions start at Col 3)
     for i in range(num_sessions):
         start_col = 3 + (i * 3)
         end_col = start_col + 2
@@ -485,7 +492,6 @@ def format_protocol_sheet(ws, num_sessions):
 
 
 def format_daily_sheet(ws, num_dates, overall_eff_val):
-    """Formats A2 and A4 exactly like process_daily_attendance.py."""
     ws['A1'] = 'Student Name & Roll No'
     ws.merge_cells('A1:A2')
     ws.delete_rows(3)
@@ -533,9 +539,12 @@ def format_daily_sheet(ws, num_dates, overall_eff_val):
                     cell.fill = red_fill
                     cell.font = red_font
                 elif val.endswith('%') and val != 'n/a':
-                    if float(val.strip('%')) < 80.0:
-                        cell.fill = red_fill
-                        cell.font = red_font
+                    try:
+                        if float(val.strip('%')) < 80.0:
+                            cell.fill = red_fill
+                            cell.font = red_font
+                    except ValueError:
+                        pass
             except (AttributeError, ValueError):
                 pass
 
@@ -548,20 +557,20 @@ def format_daily_sheet(ws, num_dates, overall_eff_val):
 
             val = str(cell.value).strip().lower()
             if val.endswith('%') and val != 'n/a':
-                if float(val.strip('%')) < 80.0:
-                    cell.fill = red_fill
-                    cell.font = Font(color="9C0006", bold=True)
+                try:
+                    if float(val.strip('%')) < 80.0:
+                        cell.fill = red_fill
+                        cell.font = Font(color="9C0006", bold=True)
+                except ValueError:
+                    pass
         except (AttributeError, ValueError):
             pass
 
-    # Merge Total Count, Estimated, True columns for each date in the summary row
-    # (Col 1 = Student Name, Col 2 = Label Size, so dates start at Col 3)
     for i in range(num_dates):
         start_col = 3 + (i * 3)
         end_col = start_col + 2
         ws.merge_cells(start_row=max_row, start_column=start_col, end_row=max_row, end_column=end_col)
 
-    # Append OVERALL TOTAL EFFICIENCY below the date efficiencies
     overall_row = max_row + 1
     ws.cell(row=overall_row, column=1, value="OVERALL TOTAL EFFICIENCY")
     ws.cell(row=overall_row, column=2, value=overall_eff_val)
@@ -582,7 +591,6 @@ def format_daily_sheet(ws, num_dates, overall_eff_val):
 
 
 def format_summary_sheet(ws):
-    """Formats the combined Overview Summary sheet (A1, A2, A3, A4 side-by-side)."""
     ws['A1'] = 'Student Name & Roll No'
     ws.merge_cells('A1:A2')
     ws.delete_rows(3)
@@ -622,9 +630,12 @@ def format_summary_sheet(ws):
 
                 val = str(cell.value).strip().lower()
                 if val.endswith('%') and val != 'n/a':
-                    if float(val.strip('%')) < 80.0:
-                        cell.fill = red_fill
-                        cell.font = red_font
+                    try:
+                        if float(val.strip('%')) < 80.0:
+                            cell.fill = red_fill
+                            cell.font = red_font
+                    except ValueError:
+                        pass
             except (AttributeError, ValueError):
                 pass
 
@@ -637,9 +648,12 @@ def format_summary_sheet(ws):
 
             val = str(cell.value).strip().lower()
             if val.endswith('%') and val != 'n/a':
-                if float(val.strip('%')) < 80.0:
-                    cell.fill = red_fill
-                    cell.font = Font(color="9C0006", bold=True)
+                try:
+                    if float(val.strip('%')) < 80.0:
+                        cell.fill = red_fill
+                        cell.font = Font(color="9C0006", bold=True)
+                except ValueError:
+                    pass
         except (AttributeError, ValueError):
             pass
 
@@ -651,7 +665,7 @@ def format_summary_sheet(ws):
 
 
 # ==============================================================================
-# MAIN RUNNER: GENERATES ONE EXCEL WORKBOOK & CSV WITH A1, A2, A3, A4
+# MAIN RUNNER
 # ==============================================================================
 def process_all_attendance(base_dir, target_folder):
     input_dir = os.path.join(base_dir, target_folder)
@@ -663,12 +677,12 @@ def process_all_attendance(base_dir, target_folder):
         print(f"No output CSV files found in {input_dir}")
         return
 
-    print("1. Running A1: Cam1 + Cam2 Union per Protocol (process_attendance.py logic)...")
+    print("1. Running A1: Cam1 + Cam2 Union per Protocol...")
     df_a1, info_a1 = run_protocol_attendance(
         output_files, true_df, roll_to_combo, short_to_roll, base_to_protocol, roll_to_labels, cam1_only=False
     )
 
-    print("2. Running A2: Cam1 + Cam2 Combined per Day with Threshold (process_daily_attendance.py logic)...")
+    print("2. Running A2: Cam1 + Cam2 Combined per Day with Threshold...")
     df_a2, info_a2 = run_daily_attendance(
         output_files, true_df, roll_to_combo, short_to_roll, roll_to_labels, cam1_only=False
     )
@@ -683,7 +697,6 @@ def process_all_attendance(base_dir, target_folder):
         output_files, true_df, roll_to_combo, short_to_roll, roll_to_labels, cam1_only=True
     )
 
-    # Build a clean Summary Table (Label Size + A1 Protocols & Overall + A2 Daily + A3 Protocols & Overall + A4 Daily)
     summary_cols = {}
     if not df_a1.empty:
         summary_cols[('Dataset', 'Label Size')] = df_a1[('Dataset', 'Comparison', 'Label Size')]
@@ -708,11 +721,9 @@ def process_all_attendance(base_dir, target_folder):
     summary_overview_df.columns = pd.MultiIndex.from_tuples(summary_overview_df.columns)
     summary_overview_df.index.name = 'Student Name & Roll No'
 
-    # Save Everything into One Excel File + CSVs
     excel_output = os.path.join(input_dir, "All_4_Algorithms_Attendance_Report.xlsx")
     summary_csv_output = os.path.join(input_dir, "All_4_Algorithms_Summary.csv")
 
-    # Save individual CSVs + combined summary CSV
     summary_overview_df.to_csv(summary_csv_output)
     if not df_a1.empty:
         df_a1.to_csv(os.path.join(input_dir, "A1_Report_With_Efficiency.csv"))
@@ -734,7 +745,6 @@ def process_all_attendance(base_dir, target_folder):
         if not df_a4.empty:
             df_a4.to_excel(writer, sheet_name='A4_Daily_Cam1')
 
-    # Apply Exact OpenPyXL Formatting to Each Sheet
     wb = openpyxl.load_workbook(excel_output)
     if 'Summary_All_4_Algos' in wb.sheetnames:
         format_summary_sheet(wb['Summary_All_4_Algos'])
