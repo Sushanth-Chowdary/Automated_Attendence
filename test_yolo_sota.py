@@ -1,20 +1,20 @@
 # test_yolo_sota.py  –  SOTA Multi-Process Batch Video Evaluation & Rich Dashboard
 # ==============================================================================
-# Upgrades:
-#   1. ProcessPoolExecutor multi-worker (MAX_WORKERS=6) & Rich live dashboard
-#   2. YOLO26-Face with 5-point keypoints (fallback chain to YOLOv8-Face)
-#   3. OC-SORT / CMC Tracker (custom_ocsort.yaml auto-creation)
-#   4. GPU float32 5-point affine warp to 112x112 (ArcFace reference)
-#   5. AdaFace IResNet-50 feature extraction (512-D) matching webface4m checkpoint
-#   6. Feature-norm (||f||_2) quality gating
-#   7. Quality-Weighted Softmax Voting + EMA Tracklet Smoothing
-#   8. FIXED: Detection Count increments by 1 per passing Track ID
+# Upgrades & Synchronizations with sweep_yolo_sota.py:
+#   1. Exact Window-Vote Synchronization: 1 window (FRAMES_PER_VOTE) = 1 vote
+#      (fixes the K-vote inflation bug & pre-window norm filtering drift).
+#   2. Fixed Softmax Quality Masking: frames failing NORM_QUALITY_THRESHOLD are
+#      masked with -1e4 before Softmax so blurry frames get 0.0 weight.
+#   3. Exact Per-Class Top-2 Margin Filtering (scatter_reduce amax over classes).
+#   4. Track-Level Quality-Weighted Centroid Verification (Post-Confirmation Gate).
+#   5. Continuous Confidence-Weighted Track Scoring & High-Certainty Single-Track
+#      Rescue (awards +1 bonus Detection Count for rock-solid single tracks, and
+#      logs Continuous_Score + Centroid_Sim in *_DEBUG_Tracks.csv & *_output.csv).
 # ==============================================================================
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# 1. Imports
 import gc
 import time
 import queue
@@ -22,8 +22,7 @@ import random
 import pickle
 import warnings
 import threading
-from datetime import datetime
-from collections import Counter, OrderedDict
+from collections import Counter
 import concurrent.futures
 import multiprocessing as mp
 
@@ -42,8 +41,25 @@ from ultralytics import YOLO
 from rich.live import Live
 from rich.table import Table
 
-# Suppress serialization warnings from third-party weights
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+# ==========================================
+# 1. HYPERPARAMETERS (Synced with sweep_yolo_sota.py)
+# ==========================================
+CONFIDENCE_THRESHOLD   = 0.4125
+NORM_QUALITY_THRESHOLD = 7.0
+EMA_MOMENTUM           = 0.708
+FRAMES_PER_VOTE        = 4
+SOFTMAX_TAU            = 5.0
+MIN_BOX_SIZE           = 50.0
+MIN_TOTAL_FRAMES       = 30
+MIN_TOTAL_SAMPLES      = 16
+MIN_SAMPLE_RATIO       = 0.3222
+MIN_WIN_RATIO          = 0.3604
+MARGIN_THRESHOLD       = 0.015
+CENTROID_THRESHOLD     = 0.380
+FRAME_SKIP             = 1
 
 
 class ThreadedVideoReader:
@@ -121,44 +137,96 @@ def format_timestamp(frame_count, fps):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir):
+@torch.no_grad()
+def compute_per_class_similarities(query_emb, ref_embs_t, y_real_t, n_classes):
+    """
+    Computes exact max cosine similarity per distinct student class for query_emb (1, 512).
+    Returns a 1D tensor of shape (n_classes,).
+    """
+    sim = torch.mm(query_emb.to(ref_embs_t.dtype), ref_embs_t)  # (1, G)
+    class_sims = torch.full((1, n_classes), -2.0, dtype=sim.dtype, device=sim.device)
+    class_sims.scatter_reduce_(1, y_real_t.unsqueeze(0), sim, reduce='amax', include_self=True)
+    return class_sims.squeeze(0)
+
+
+@torch.no_grad()
+def save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names,
+                            ref_embs_t, y_real_t, name_to_cls_idx, output_dir):
     final_mem = {**archived_tracks, **active_track_memory}
     debug_data = []
     student_presence = {name: False for name in target_names}
     student_detection_count = {name: 0 for name in target_names}
+    student_continuous_score = {name: 0.0 for name in target_names}
+    n_classes = len(target_names)
 
     for t_id, data in sorted(final_mem.items(), key=lambda x: x[0]):
         total_frames = data.get('frames_alive', 0)
         all_preds = data['all_preds']
         valid_preds = [p for p in all_preds if p != "Unknown"]
         valid_votes_count = len(valid_preds)
+        total_samples = len(all_preds)
+
+        centroid_sim = 0.0
+        continuous_score = 0.0
+        track_weight = 0
 
         if valid_votes_count > 0:
             counts = Counter(valid_preds)
-            winner = counts.most_common(1)[0][0]
-            win_ratio = counts.get(winner, 0) / valid_votes_count
-            total_samples = len(all_preds)
-            sample_ratio = counts.get(winner, 0) / total_samples if total_samples > 0 else 0
+            winner, best_votes = counts.most_common(1)[0]
+            win_ratio = best_votes / valid_votes_count
+            sample_ratio = best_votes / total_samples if total_samples > 0 else 0.0
 
-            status = "Passed" if (total_frames >= 30 and
-                                  total_samples >= 16 and
-                                  sample_ratio >= 0.3222 and
-                                  win_ratio >= 0.3604) else "Failed"
+            # Upgrade 3: Track-Level Centroid Matching (Post-Confirmation Gate)
+            if data.get('centroid_accum') is not None and winner in name_to_cls_idx:
+                win_cls_idx = name_to_cls_idx[winner]
+                cent_emb = F.normalize(data['centroid_accum'], p=2, dim=1)
+                class_sims = compute_per_class_similarities(cent_emb, ref_embs_t, y_real_t, n_classes)
+                centroid_sim = float(class_sims[win_cls_idx].item())
+
+            passed_stage1 = (
+                total_frames >= MIN_TOTAL_FRAMES and
+                total_samples >= MIN_TOTAL_SAMPLES and
+                sample_ratio >= MIN_SAMPLE_RATIO and
+                win_ratio >= MIN_WIN_RATIO
+            )
+            passed_centroid = centroid_sim >= CENTROID_THRESHOLD
+
+            if passed_stage1 and passed_centroid:
+                status = "Passed"
+                continuous_score = round(sample_ratio * win_ratio * max(0.0, centroid_sim), 4)
+                # Upgrade 2: High-Certainty Single-Track Rescue (+1 bonus detection count)
+                is_high_cert = (
+                    best_votes >= 2.5 * MIN_TOTAL_SAMPLES and
+                    win_ratio >= 0.75 and
+                    centroid_sim >= (CONFIDENCE_THRESHOLD + 0.04)
+                )
+                track_weight = 2 if is_high_cert else 1
+            elif passed_stage1 and not passed_centroid:
+                status = f"Failed (Centroid {centroid_sim:.3f} < {CENTROID_THRESHOLD})"
+            else:
+                status = "Failed"
         else:
             winner = "Unknown"
             status = "Failed"
-            counts = Counter(all_preds)
+            win_ratio = 0.0
+            sample_ratio = 0.0
 
         if status == "Passed" and winner != "Unknown":
             student_presence[winner] = True
-            student_detection_count[winner] += 1  # Increments by exactly 1 per passing Track ID
+            student_detection_count[winner] += track_weight
+            student_continuous_score[winner] = round(student_continuous_score[winner] + continuous_score, 4)
 
         debug_data.append({
             'Track ID': t_id,
             'Start Time': data.get('start_time', ''),
             'Total Frames': total_frames,
             'Valid Votes': valid_votes_count,
-            'Total Preds (inc. Unknown)': len(all_preds),
+            'Total Windows (Samples)': total_samples,
+            'Sample Ratio': round(sample_ratio, 4),
+            'Win Ratio': round(win_ratio, 4),
+            'Centroid Sim': round(centroid_sim, 4),
+            'Continuous Score': continuous_score,
+            'Detection Weight': track_weight,
             'Predicted Identity': winner,
             'Gate Status': status,
             'Breakdown': dict(Counter(all_preds))
@@ -167,7 +235,12 @@ def save_attendance_results(video_filename, archived_tracks, active_track_memory
     stem = os.path.splitext(video_filename)[0]
     pd.DataFrame(debug_data).to_csv(os.path.join(output_dir, f"{stem}_DEBUG_Tracks.csv"), index=False)
 
-    output_data = [{'Name': s, 'Status': 'Present' if student_presence[s] else 'Absent', 'Detection Count': student_detection_count[s]} for s in target_names]
+    output_data = [{
+        'Name': s,
+        'Status': 'Present' if student_presence[s] else 'Absent',
+        'Detection Count': student_detection_count[s],
+        'Continuous_Score': student_continuous_score[s]
+    } for s in target_names]
     pd.DataFrame(output_data).to_csv(os.path.join(output_dir, f"{stem}_output.csv"), index=False)
 
 
@@ -252,7 +325,7 @@ def load_adaface_model(device, use_half=False):
                     clean_sd[k[len('model.'):]] = v
                 elif k in model.state_dict():
                     clean_sd[k] = v
-            missing, unexpected = model.load_state_dict(clean_sd, strict=False)
+            model.load_state_dict(clean_sd, strict=False)
             loaded = True
             break
     if not loaded:
@@ -289,7 +362,6 @@ def load_yolo_face(device, use_engine=False):
 OCSORT_TRACKER_PATH = "custom_ocsort.yaml"
 
 def ensure_ocsort_tracker():
-    """Create / overwrite custom_ocsort.yaml with ByteTrack tracker config."""
     tracker_cfg = {
         'tracker_type': 'bytetrack',
         'track_high_thresh': 0.5,
@@ -316,15 +388,10 @@ ARCFACE_DST = torch.tensor([
 
 _dst_norm_const = (ARCFACE_DST / 111.0) * 2.0 - 1.0
 _X_const = torch.cat([_dst_norm_const, torch.ones((5, 1), dtype=torch.float32)], dim=1)
-ARCFACE_PINV = torch.linalg.pinv(_X_const).contiguous()  # (3, 5)
+ARCFACE_PINV = torch.linalg.pinv(_X_const).contiguous()
 
 
 def extract_faces_112(frame_tensor_chw, results, valid_mask, valid_boxes, arcface_pinv, frame_h, frame_w, device):
-    """
-    - If YOLO model outputs real 5-point landmarks: performs zero-expansion GPU 5-point affine warp to 112x112.
-    - If YOLO model outputs boxes only (keypoints is None): performs GPU 15%-margin roi_align to 112x112
-      so crop geometry matches the 160x160 (15%-margin) training images in ./LABELS 100%!
-    """
     has_real_kpts = (
         results[0].keypoints is not None and
         results[0].keypoints.xy is not None and
@@ -370,23 +437,17 @@ def extract_faces_112(frame_tensor_chw, results, valid_mask, valid_boxes, arcfac
 # ==========================================
 yolo_model = None
 resnet = None
-ref_embeddings_tensor = None
+ref_embeddings_t = None
 target_names = []
-y_real = []
+y_real_t = None
+name_to_cls_idx = {}
 device = None
 use_half = False
-
-CONFIDENCE_THRESHOLD = 0.4125    
-FRAME_SKIP = 1
-FRAMES_PER_VOTE = 4
-NORM_QUALITY_THRESHOLD = 7.0
-EMA_MOMENTUM = 0.708
-SOFTMAX_TAU = 5.0
 
 
 def init_worker():
     """Initializes models once per worker process to prevent redundant reload overhead."""
-    global yolo_model, resnet, ref_embeddings_tensor, target_names, y_real, device, use_half
+    global yolo_model, resnet, ref_embeddings_t, target_names, y_real_t, name_to_cls_idx, device, use_half
 
     cv2.setNumThreads(1)
     time.sleep(random.uniform(0.2, 2.5))
@@ -394,15 +455,10 @@ def init_worker():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     use_half = torch.cuda.is_available()
 
-    # Load YOLO face model (never .engine in multi-process workers)
     yolo_model = load_yolo_face(device, use_engine=False)
-
-    # Load AdaFace IResNet-50
     resnet = load_adaface_model(device, use_half=use_half)
 
-    # Load FAISS Gallery (SOTA index)
     faiss_index_path = './face_attendance_sota_faiss.bin'
-    ref_embeddings_tensor = None
     if os.path.exists(faiss_index_path):
         index = faiss.read_index(faiss_index_path)
         index.nprobe = 20
@@ -412,25 +468,27 @@ def init_worker():
             index.make_direct_map()
             ref_embeddings = np.array([index.reconstruct(i) for i in range(index.ntotal)])
 
-        ref_embeddings_tensor = torch.from_numpy(ref_embeddings).to(device).float()
-        ref_embeddings_tensor = F.normalize(ref_embeddings_tensor, p=2, dim=1)
+        ref_tensor = torch.from_numpy(ref_embeddings).to(device).float()
+        ref_tensor = F.normalize(ref_tensor, p=2, dim=1)
         if use_half:
-            ref_embeddings_tensor = ref_embeddings_tensor.half()
+            ref_tensor = ref_tensor.half()
+        ref_embeddings_t = ref_tensor.t().contiguous()  # (512, G)
     else:
         raise FileNotFoundError("Please run 'python train_yolo_sota.py' first to build './face_attendance_sota_faiss.bin'!")
 
-    # Load Metadata (SOTA meta)
     meta_path = './face_attendance_sota_meta.pkl'
     if not os.path.exists(meta_path):
         raise FileNotFoundError("Please run 'python train_yolo_sota.py' first to build './face_attendance_sota_meta.pkl'!")
     with open(meta_path, 'rb') as f:
         saved_data = pickle.load(f)
-    target_names, y_real = saved_data['target_names'], saved_data['y_real']
+    target_names = saved_data['target_names']
+    y_real_t = torch.tensor(saved_data['y_real'], dtype=torch.int64, device=device)
+    name_to_cls_idx = {name: idx for idx, name in enumerate(target_names)}
 
 
 def process_video(video_filename, input_dir, output_dir, progress_q):
     """Processes a single video and pushes live telemetry through progress_q."""
-    global yolo_model, resnet, arcface_dst, ref_embeddings_tensor, target_names, y_real, device, use_half
+    global yolo_model, resnet, ref_embeddings_t, target_names, y_real_t, name_to_cls_idx, device, use_half
 
     video_path = os.path.join(input_dir, video_filename)
     video_stem = os.path.splitext(video_filename)[0]
@@ -438,12 +496,10 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
     debug_csv = os.path.join(output_dir, f"{video_stem}_DEBUG_Tracks.csv")
     final_video_path = os.path.join(output_dir, f"{video_stem}_output.mp4")
 
-    # Resume capability: Only skip if output_csv exists AND video file is non-empty
     if os.path.exists(output_csv) and os.path.exists(final_video_path) and os.path.getsize(final_video_path) > 1024:
         progress_q.put({"type": "skip", "file": video_filename})
         return video_filename, "Skipped"
 
-    # Reset YOLO tracker state across videos without setting predictor to None
     if hasattr(yolo_model, 'predictor') and yolo_model.predictor is not None:
         if hasattr(yolo_model.predictor, 'trackers') and yolo_model.predictor.trackers:
             for tracker in yolo_model.predictor.trackers:
@@ -462,7 +518,6 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
     writer_thread.daemon = True
     writer_thread.start()
 
-    # Video-local track ID mapping: guarantees every video starts cleanly at ID:1
     local_id_counter = 0
     raw_to_local_id = {}
 
@@ -471,6 +526,7 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
     t_start = time.perf_counter()
     processing_succeeded = False
     error_msg = None
+    n_classes = len(target_names)
 
     try:
         while video_stream.more():
@@ -492,11 +548,10 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
             local_ids_list = []
             frame_names = []
 
-            if has_detections and ref_embeddings_tensor is not None:
+            if has_detections and ref_embeddings_t is not None:
                 boxes = results[0].boxes.xyxy.to(device)
                 raw_ids = results[0].boxes.id.to(device).int().cpu().tolist()
 
-                # Map raw tracker IDs to local 1-based sequential IDs for this video
                 local_ids_list = []
                 for r_id in raw_ids:
                     if r_id not in raw_to_local_id:
@@ -509,9 +564,12 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
                     if t_id not in active_track_memory:
                         active_track_memory[t_id] = {
                             'start_time': format_timestamp(frame_count, video_stream.fps),
-                            'frames_alive': 0, 'buffer': [], 'all_preds': [], 'missing_frames': 0,
+                            'frames_alive': 0,
+                            'all_preds': [],
+                            'missing_frames': 0,
                             'crop_buffer': [],
-                            'ema_emb': None
+                            'ema_emb': None,
+                            'centroid_accum': None,
                         }
                     active_track_memory[t_id]['frames_alive'] += 1
 
@@ -522,7 +580,12 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
                     box_h = boxes[:, 3] - boxes[:, 1]
                     aspect_ratios = box_w / (box_h + 1e-6)
 
-                    valid_mask = (box_w >= 50) & (box_h >= 50) & (aspect_ratios >= 0.7) & (aspect_ratios <= 1.7)
+                    valid_mask = (
+                        (box_w >= MIN_BOX_SIZE) &
+                        (box_h >= MIN_BOX_SIZE) &
+                        (aspect_ratios >= 0.7) &
+                        (aspect_ratios <= 1.7)
+                    )
 
                     if valid_mask.any():
                         valid_boxes = boxes[valid_mask].clone()
@@ -548,67 +611,80 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
 
                             if len(active_track_memory[t_id]['crop_buffer']) >= FRAMES_PER_VOTE:
                                 batch_tensors.extend(active_track_memory[t_id]['crop_buffer'])
-                                batch_track_ids.extend([t_id] * len(active_track_memory[t_id]['crop_buffer']))
+                                batch_track_ids.append(t_id)
                                 active_track_memory[t_id]['crop_buffer'] = []
 
                     if batch_tensors:
                         with torch.inference_mode():
-                            batch_tensor = torch.cat(batch_tensors, dim=0)  # (N, 3, 112, 112)
-                            # Normalize to [-1, 1] keeping BGR order (AdaFace trained on BGR)
+                            batch_tensor = torch.cat(batch_tensors, dim=0)  # (N_windows * fpv, 3, 112, 112)
                             batch_tensor = (batch_tensor / 127.5) - 1.0
                             if use_half:
                                 batch_tensor = batch_tensor.half()
 
                             normed_embeddings, feature_norms = resnet(batch_tensor)
+                            norms_flat = feature_norms.squeeze(1).float()  # (N_windows * fpv,)
 
-                            # Quality gate: feature norm
-                            norms_flat = feature_norms.squeeze(1)  # (N,)
-                            quality_mask = norms_flat >= NORM_QUALITY_THRESHOLD
-                            quality_mask_list = quality_mask.cpu().tolist()
+                            # Process each window of FRAMES_PER_VOTE frames (exact match with sweep_yolo_sota.py)
+                            for w_idx, t_id in enumerate(batch_track_ids):
+                                s0 = w_idx * FRAMES_PER_VOTE
+                                s1 = s0 + FRAMES_PER_VOTE
+                                e_win_crops = normed_embeddings[s0:s1].float()  # (fpv, 512)
+                                n_win_crops = norms_flat[s0:s1]                 # (fpv,)
 
-                            # Group valid embeddings/norms by track ID
-                            track_emb_groups = {}
-                            for k in range(len(batch_track_ids)):
-                                if quality_mask_list[k]:
-                                    t_id = batch_track_ids[k]
-                                    if t_id not in track_emb_groups:
-                                        track_emb_groups[t_id] = {'embs': [], 'norms': []}
-                                    track_emb_groups[t_id]['embs'].append(normed_embeddings[k:k+1])
-                                    track_emb_groups[t_id]['norms'].append(norms_flat[k:k+1])
+                                # Bug A Fix: Mask out frames failing NORM_QUALITY_THRESHOLD with -1e4 before Softmax
+                                frame_ok = n_win_crops >= NORM_QUALITY_THRESHOLD
+                                valid_window = bool(frame_ok.any().item())
 
-                            for t_id, group in track_emb_groups.items():
-                                e_track = torch.cat(group['embs'], dim=0)  # (K, 512)
-                                n_track = torch.cat(group['norms'], dim=0).unsqueeze(1)  # (K, 1)
-                                K = e_track.size(0)
+                                logits = torch.where(
+                                    frame_ok,
+                                    n_win_crops / SOFTMAX_TAU,
+                                    torch.tensor(-1e4, device=device, dtype=torch.float32)
+                                )
+                                weights = torch.softmax(logits, dim=0).unsqueeze(1)  # (fpv, 1)
+                                e_win = F.normalize(torch.sum(weights * e_win_crops, dim=0, keepdim=True), p=2, dim=1)
 
-                                # Softmax quality weights with temperature tau
-                                weights = torch.softmax(n_track / SOFTMAX_TAU, dim=0)  # (K, 1)
+                                if valid_window:
+                                    # Accumulate quality-weighted global track centroid
+                                    raw_w = (n_win_crops * frame_ok.float()).unsqueeze(1)
+                                    cent_step = torch.sum(raw_w * e_win_crops, dim=0, keepdim=True)
+                                    if active_track_memory[t_id]['centroid_accum'] is None:
+                                        active_track_memory[t_id]['centroid_accum'] = cent_step
+                                    else:
+                                        active_track_memory[t_id]['centroid_accum'] = (
+                                            active_track_memory[t_id]['centroid_accum'] + cent_step
+                                        )
 
-                                # Quality-weighted window embedding
-                                e_win = F.normalize(
-                                    torch.sum(weights * e_track, dim=0, keepdim=True),
-                                    p=2, dim=1
-                                )  # (1, 512)
+                                    # EMA Update
+                                    if active_track_memory[t_id]['ema_emb'] is None:
+                                        ema_emb = e_win
+                                    else:
+                                        prev_ema = active_track_memory[t_id]['ema_emb']
+                                        ema_emb = F.normalize(
+                                            EMA_MOMENTUM * prev_ema + (1.0 - EMA_MOMENTUM) * e_win,
+                                            p=2, dim=1
+                                        )
+                                    active_track_memory[t_id]['ema_emb'] = ema_emb
 
-                                # EMA update
-                                if active_track_memory[t_id]['ema_emb'] is None:
-                                    ema_emb = e_win
-                                else:
-                                    prev_ema = active_track_memory[t_id]['ema_emb']
-                                    ema_emb = F.normalize(
-                                        EMA_MOMENTUM * prev_ema + (1.0 - EMA_MOMENTUM) * e_win,
-                                        p=2, dim=1
+                                    # Upgrade 1: Exact Per-Class Top-2 Margin Filtering
+                                    class_sims = compute_per_class_similarities(
+                                        ema_emb, ref_embeddings_t, y_real_t, n_classes
                                     )
-                                active_track_memory[t_id]['ema_emb'] = ema_emb
+                                    top2_vals, top2_cls = class_sims.topk(2, dim=0)
+                                    conf_score = float(top2_vals[0].item())
+                                    margin_diff = float((top2_vals[0] - top2_vals[1]).item())
+                                    win_cls = int(top2_cls[0].item())
 
-                                # Match against gallery
-                                sim_matrix = torch.mm(ema_emb.to(ref_embeddings_tensor.dtype), ref_embeddings_tensor.t())
-                                max_sim, max_idx = torch.max(sim_matrix, dim=1)
-                                conf_score = max_sim.item()
-                                winner = target_names[y_real[max_idx.item()]] if conf_score > CONFIDENCE_THRESHOLD else "Unknown"
+                                    if conf_score >= CONFIDENCE_THRESHOLD and margin_diff >= MARGIN_THRESHOLD:
+                                        winner = target_names[win_cls]
+                                    else:
+                                        winner = "Unknown"
+                                else:
+                                    conf_score = 0.0
+                                    winner = "Unknown"
 
                                 track_identities[t_id] = (winner, conf_score)
-                                active_track_memory[t_id]['all_preds'].extend([winner] * K)
+                                # Exact 1 vote per window (synchronized with sweep_yolo_sota.py)
+                                active_track_memory[t_id]['all_preds'].append(winner)
 
                 boxes_cpu = boxes.cpu().numpy()
                 for i in range(len(local_ids_list)):
@@ -652,10 +728,12 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
         writer_thread.join()
 
         if processing_succeeded:
-            save_attendance_results(video_filename, archived_tracks, active_track_memory, target_names, output_dir)
+            save_attendance_results(
+                video_filename, archived_tracks, active_track_memory, target_names,
+                ref_embeddings_t, y_real_t, name_to_cls_idx, output_dir
+            )
             progress_q.put({"type": "finish", "file": video_filename})
         else:
-            # Clean up broken/empty files if video crashed so resume doesn't skip it next time
             for p in (final_video_path, output_csv, debug_csv):
                 if os.path.exists(p):
                     try:
@@ -676,7 +754,6 @@ def process_video(video_filename, input_dir, output_dir, progress_q):
 # 3. Terminal Live Dashboard
 # ==========================================
 def run_live_dashboard(progress_q, total_videos, stop_event):
-    """Renders a real-time console table displaying progress and FPS per video."""
     active_videos = {}
     completed = 0
     failed = 0
