@@ -766,6 +766,6 @@ def process_all_attendance(base_dir, target_folder):
 
 if __name__ == "__main__":
     BASE_DIRECTORY = "ATTENDENCE RESULTS/Results"
-    TARGET_FOLDER = "test 9"
+    TARGET_FOLDER = "test 11"
 
     process_all_attendance(BASE_DIRECTORY, TARGET_FOLDER)

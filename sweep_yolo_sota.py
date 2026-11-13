@@ -135,7 +135,7 @@ MAX_STAGE1_WORKERS = 4
 GPU_BATCH_SIZE = 512
 AT_BUDGET = 600_000
 SIM_ROW_CHUNK_ELEMS = 1 << 26
-PROTOTYPES_PER_CLASS = 64  # 4 Sub-Centers + 60 Pose-Stratified Exemplars per class
+PROTOTYPES_PER_CLASS = 0   # 0 = Full 245k FAISS Gallery (exact 1:1 match with test_yolo_sota.py)
 ACTIVE_GPUS = [1, 2, 7]
 
 # ==========================================
@@ -167,12 +167,13 @@ def is_cam1_video(filename):
 
 def condense_gallery_prototypes(ref_tensor, y_real, num_classes, max_per_class=PROTOTYPES_PER_CLASS):
     """
-    Condenses the 245k gallery into `max_per_class` (64) high-coverage prototypes per student:
-      - Always retains the last 4 vectors (1 Global Class Centroid + 3 Spherical K-Means Sub-Centers
-        appended by train_yolo_sota.py).
-      - Uniformly samples up to `max_per_class - 4` (60) vectors across the student's full gallery
-        enrollment sequence so every head pose, distance, and lighting condition is represented.
+    If max_per_class <= 0 (default), retains the FULL 245k FAISS gallery to match test_yolo_sota.py 1:1.
+    Otherwise, condenses the gallery into `max_per_class` high-coverage prototypes per student.
     """
+    if max_per_class is None or max_per_class <= 0:
+        final_embs = F.normalize(ref_tensor.detach().cpu().float(), p=2, dim=1)
+        final_y = np.asarray(y_real, dtype=np.int64)
+        return final_embs, final_y
     condensed_embs = []
     condensed_y = []
     y_real_cpu = torch.as_tensor(y_real, dtype=torch.int64, device='cpu')
@@ -992,10 +993,16 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
     y_real       = meta_data['y_real']
     roll_names   = [short_to_roll.get(n.strip(), n.strip()) for n in target_names]
 
-    console.print(f"[cyan]  Condensing FAISS gallery ({len(ref_np):,} embs) -> {PROTOTYPES_PER_CLASS} stratified prototypes/student...[/cyan]")
-    ref_embs_f32, y_real = condense_gallery_prototypes(ref_embs_raw, y_real, len(target_names), PROTOTYPES_PER_CLASS)
-    ref_embs = ref_embs_f32.half()
-    console.print(f"[bold green]  -> Gallery condensed to {ref_embs.shape[0]:,} prototypes! Fits in A100 L2 cache for ~10s/epoch speed.[/bold green]")
+    if PROTOTYPES_PER_CLASS and PROTOTYPES_PER_CLASS > 0:
+        console.print(f"[cyan]  Condensing FAISS gallery ({len(ref_np):,} embs) -> {PROTOTYPES_PER_CLASS} stratified prototypes/student...[/cyan]")
+        ref_embs_f32, y_real = condense_gallery_prototypes(ref_embs_raw, y_real, len(target_names), PROTOTYPES_PER_CLASS)
+        ref_embs = ref_embs_f32.half()
+        console.print(f"[bold green]  -> Gallery condensed to {ref_embs.shape[0]:,} prototypes![/bold green]")
+    else:
+        console.print(f"[cyan]  Loading FULL FAISS gallery ({len(ref_np):,} embeddings) onto A100 GPUs (100% 1:1 match with test_yolo_sota.py)...[/cyan]")
+        ref_embs_f32, y_real = condense_gallery_prototypes(ref_embs_raw, y_real, len(target_names), 0)
+        ref_embs = ref_embs_f32.half()
+        console.print(f"[bold green]  -> Full gallery loaded: {ref_embs.shape[0]:,} FP16 vectors ({ref_embs.numel() * 2 / (1024**2):.1f} MB VRAM)![/bold green]")
 
     console.print(f"[cyan]  Loading feature caches for {len(target_videos)} videos -> CPU memory...[/cyan]")
     cpu_videos = []
@@ -1057,26 +1064,56 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
 
 
 @torch.no_grad()
-def _fpv_info(bank, fpv):
+def _fpv_info(bank, fpv, mbs=50.0):
+    """
+    Pre-filters track frames by (box_w >= mbs) & (box_h >= mbs) BEFORE grouping into
+    windows of `fpv`, matching test_yolo_sota.py's crop_buffer logic 1:1.
+    """
+    mbs_key = (int(fpv), round(float(mbs), 4))
     cache = bank['fpv_cache']
-    if fpv in cache:
-        return cache[fpv]
-    lens = bank['lens_np']
-    ok = np.nonzero(lens >= fpv)[0]
-    if ok.size == 0:
-        cache[fpv] = None
+    if mbs_key in cache:
+        return cache[mbs_key]
+
+    dev = bank['device']
+    T = bank['T']
+    if T == 0:
+        cache[mbs_key] = None
         return None
-    W = lens[ok] // fpv
+
+    bw_cpu = bank['box_w_cpu']
+    bh_cpu = bank['box_h_cpu']
+    starts_np = bank['starts_np']
+    lens_np = bank['lens_np']
+
+    valid_mask_np = (bw_cpu >= mbs) & (bh_cpu >= mbs)
+    valid_indices_all = np.nonzero(valid_mask_np)[0].astype(np.int64)
+
+    # Compute how many valid frames (>= mbs) each track has using prefix sums
+    csum = np.empty(len(valid_mask_np) + 1, dtype=np.int64)
+    csum[0] = 0
+    np.cumsum(valid_mask_np, out=csum[1:])
+    valid_lens = csum[starts_np + lens_np] - csum[starts_np]
+
+    ok = np.nonzero(valid_lens >= fpv)[0]
+    if ok.size == 0:
+        cache[mbs_key] = None
+        return None
+
+    W = valid_lens[ok] // fpv
     order = np.argsort(-W, kind='stable')
     sel = ok[order]
     W_s = W[order]
     Wmax = int(W_s[0])
     asc = np.ascontiguousarray(W_s[::-1])
     n_gt = len(W_s) - np.searchsorted(asc, np.arange(Wmax), side='right')
-    dev = bank['device']
+
+    # Where each selected track's valid frames start inside `valid_indices_all`
+    v_starts_sel = csum[starts_np[sel]]
+
     tidx = torch.from_numpy(sel).to(dev)
     info = {
-        'starts': bank['starts_t'][tidx],
+        'v_starts': torch.from_numpy(v_starts_sel).to(dev),
+        'valid_idx_map': torch.from_numpy(valid_indices_all).to(dev),
         'W_t': torch.from_numpy(W_s).to(dev),
         'W_np': W_s,
         'alive': bank['alive_t'][tidx],
@@ -1086,7 +1123,7 @@ def _fpv_info(bank, fpv):
         'n_gt': n_gt,
         'Wmax': Wmax,
     }
-    cache[fpv] = info
+    cache[mbs_key] = info
     return info
 
 
@@ -1139,11 +1176,11 @@ def _chunked_class_sim_for_winners(q, ref_t, y_real_t, target_cls, n_classes):
 
 @torch.no_grad()
 def _eval_fpv_group(
-    bank, ref_embs_t, fpv, grp, P,
+    bank, ref_embs_t, fpv, mbs_val, grp, P,
     presence_all, presence_cam1, daily_counts_all, daily_counts_cam1,
     n_classes, at_budget, live
 ):
-    info = _fpv_info(bank, fpv)
+    info = _fpv_info(bank, fpv, mbs_val)
     if info is None:
         return
     dev = bank['device']
@@ -1154,11 +1191,11 @@ def _eval_fpv_group(
     if Te == 0:
         return
 
-    starts = info['starts'][:Te]
+    v_starts = info['v_starts'][:Te]
+    valid_idx_map = info['valid_idx_map']
     n_gt = info['n_gt']
     Wmax = info['Wmax']
     embs_flat, norms_flat = bank['embs'], bank['norms']
-    bw_flat, bh_flat = bank['box_w'], bank['box_h']
     y_real_t = bank['y_real_t']
     ar_f = torch.arange(fpv, device=dev)
 
@@ -1171,7 +1208,6 @@ def _eval_fpv_group(
         sub = grp[a0:a0 + A_chunk]
         A = sub.numel()
 
-        mbs   = P['MIN_BOX_SIZE'][sub].view(1, A, 1)
         nth   = P['NORM_QUALITY_THRESHOLD'][sub].view(1, A, 1)
         tau   = P['SOFTMAX_TAU'][sub].view(1, A, 1)
         mom   = P['EMA_MOMENTUM'][sub].to(cdt).view(1, A, 1)
@@ -1195,13 +1231,12 @@ def _eval_fpv_group(
             live['tracks'] = n
             live['rows_done'] += n * A
 
-            idx    = starts[:n].unsqueeze(1) + (w * fpv) + ar_f.unsqueeze(0)     # (n, fpv)
+            v_pos  = v_starts[:n].unsqueeze(1) + (w * fpv) + ar_f.unsqueeze(0)   # (n, fpv)
+            idx    = valid_idx_map[v_pos]                                        # (n, fpv) exact pre-filtered frames
             w_embs = embs_flat[idx]                                              # (n, fpv, 512)
             nrm    = norms_flat[idx]                                             # (n, fpv)
-            bw     = bw_flat[idx].unsqueeze(1)                                   # (n, 1, fpv)
-            bh     = bh_flat[idx].unsqueeze(1)
 
-            frame_ok = (bw >= mbs) & (bh >= mbs) & (nrm.unsqueeze(1) >= nth)     # (n, A, fpv)
+            frame_ok = (nrm.unsqueeze(1) >= nth)                                 # (n, A, fpv)
             valid    = frame_ok.any(dim=2)                                       # (n, A)
 
             logits  = torch.where(frame_ok, nrm.unsqueeze(1) / tau, -1e4)        # (n, A, fpv)
@@ -1384,6 +1419,9 @@ def build_track_bank(cpu_videos, true_dict, roll_names, y_real, device, min_fram
         'device': device, 'dtype': dtype,
         'T': len(lens), 'N': cursor,
         'embs': embs, 'norms': norms, 'box_w': bw, 'box_h': bh,
+        'box_w_cpu': bw.detach().cpu().numpy(),
+        'box_h_cpu': bh.detach().cpu().numpy(),
+        'starts_np': np.asarray(starts, dtype=np.int64),
         'lens_np': np.asarray(lens, dtype=np.int64),
         'starts_t':  torch.tensor(starts,    dtype=torch.int64, device=device),
         'alive_t':   torch.tensor(alive,     dtype=torch.int64, device=device),
@@ -1481,12 +1519,15 @@ def evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, device, target_algo=
     daily_counts_cam1 = torch.zeros(B, max(n_dates, 1),    n_classes, dtype=torch.int32, device=device)
 
     if n_sessions > 0 and bank['T'] > 0:
-        fpv_list = [int(p['FRAMES_PER_VOTE']) for _, p in combo_batch]
+        fpv_mbs_list = [(int(p['FRAMES_PER_VOTE']), round(float(p['MIN_BOX_SIZE']), 4)) for _, p in combo_batch]
 
         groups = []
-        for fpv in sorted(set(fpv_list)):
-            grp = torch.tensor([i for i, f in enumerate(fpv_list) if f == fpv], dtype=torch.int64, device=device)
-            info = _fpv_info(bank, fpv)
+        for fpv, mbs_val in sorted(set(fpv_mbs_list)):
+            grp = torch.tensor(
+                [i for i, fm in enumerate(fpv_mbs_list) if fm == (fpv, mbs_val)],
+                dtype=torch.int64, device=device
+            )
+            info = _fpv_info(bank, fpv, mbs_val)
             if info is None:
                 continue
             min_s = int(P['MIN_TOTAL_SAMPLES'][grp].min().item())
@@ -1494,18 +1535,18 @@ def evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, device, target_algo=
             if Te == 0:
                 continue
             work = int(grp.numel()) * int(np.minimum(info['n_gt'], Te).sum())
-            groups.append((fpv, grp, work, info['Wmax']))
+            groups.append((fpv, mbs_val, grp, work, info['Wmax']))
 
         live = {
             'phase': 'running',
             'rows_done': 0,
-            'rows_total': max(1, sum(g[2] for g in groups)),
+            'rows_total': max(1, sum(g[3] for g in groups)),
             't0': time.perf_counter(),
         }
         LIVE_STATUS[tag] = live
-        for gi, (fpv, grp, work, Wmax) in enumerate(groups, start=1):
+        for gi, (fpv, mbs_val, grp, work, Wmax) in enumerate(groups, start=1):
             _eval_fpv_group(
-                bank, ref_embs_t, fpv, grp, P,
+                bank, ref_embs_t, fpv, mbs_val, grp, P,
                 presence_all, presence_cam1, daily_counts_all, daily_counts_cam1,
                 n_classes, at_budget, live
             )
@@ -1558,6 +1599,7 @@ def evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, device, target_algo=
         res = {
             "Combo_ID": combo_id,
             **params,
+            "Gallery_Prototypes": PROTOTYPES_PER_CLASS,
             "Target_Algorithm": target_algo,
             "A1_Accuracy": round(a1_acc, 4),
             "A2_Accuracy": round(a2_acc, 4),
@@ -1921,8 +1963,20 @@ if __name__ == '__main__':
         choices=["A1", "A2", "A3", "A4", "a1", "a2", "a3", "a4"],
         help="Select which algorithm to maximize: A1 (Cam1+2 Proto), A2 (Cam1+2 Daily), A3 (Cam1 Proto), A4 (Cam1 Daily)"
     )
+    parser.add_argument(
+        "--prototypes", "-p",
+        type=int,
+        default=PROTOTYPES_PER_CLASS,
+        help="Prototypes per class (0 = Full 245k FAISS gallery for exact 1:1 match with test_yolo_sota.py)"
+    )
+    parser.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Force re-extraction of Stage 1 .pt feature cache if tracker changed"
+    )
     args, _ = parser.parse_known_args()
     TARGET_ALGORITHM = args.algo.upper()
+    PROTOTYPES_PER_CLASS = int(args.prototypes)
 
     ctx = mp.get_context('spawn')
     main_pid = os.getpid()
@@ -1978,6 +2032,14 @@ if __name__ == '__main__':
             }
 
     # 3. Build or verify Stage 1 feature cache
+    if args.rebuild_cache:
+        console.print("[bold yellow]--rebuild-cache specified: clearing old Stage 1 .pt cache files...[/bold yellow]")
+        for f in os.listdir(FEATURE_CACHE_DIR):
+            if f.endswith("_features.pt") or f.endswith("_raw_features.pt"):
+                try:
+                    os.remove(os.path.join(FEATURE_CACHE_DIR, f))
+                except OSError:
+                    pass
     ensure_all_features_cached(target_videos, INPUT_VIDEOS_DIR, FEATURE_CACHE_DIR, ctx)
 
     # 4. Load all cached video features and FAISS gallery directly into CPU shared memory
@@ -2023,7 +2085,7 @@ if __name__ == '__main__':
     if os.path.exists(final_accuracy_csv):
         try:
             existing_df = pd.read_csv(final_accuracy_csv)
-            required_v3_cols = {"Combo_ID", "A1_Accuracy", "A2_Accuracy", "A3_Accuracy", "A4_Accuracy", "MARGIN_THRESHOLD", "CENTROID_THRESHOLD"}
+            required_v3_cols = {"Combo_ID", "A1_Accuracy", "A2_Accuracy", "A3_Accuracy", "A4_Accuracy", "MARGIN_THRESHOLD", "CENTROID_THRESHOLD", "Gallery_Prototypes"}
             if not existing_df.empty and required_v3_cols.issubset(set(existing_df.columns)):
                 for _, row in existing_df.iterrows():
                     row_dict = row.to_dict()
