@@ -1,18 +1,22 @@
 # pyright: reportMissingImports=false
-# sweep_yolo_sota.py – DGX A100 GPU-Accelerated Hyperparameter Optimizer (Stage 2)
+# sweep_yolo_sota.py – DGX A100 GPU-Accelerated Hyperparameter Optimizer (Stage 2 - OC-SORT)
 # ==============================================================================
 # Upgrades:
-#   1. Multi-Algorithm Evaluation & Target Switching (A1, A2, A3, A4):
+#   1. Tracker Set to OC-SORT (custom_ocsort.yaml with track_buffer=50,
+#      fuse_score=True, missing_frames > 50) -> 100% compatible with existing .pt cache!
+#   2. Multi-Algorithm Evaluation & Target Switching (A1, A2, A3, A4):
 #      - Matches process_unified_attendance.py:
 #          * A1: Cam1 + Cam2 Union per Protocol Session
 #          * A2: Cam1 + Cam2 Combined per Day (Dynamic Threshold 1..20)
 #          * A3: Cam1 Only per Protocol Session
 #          * A4: Cam1 Only per Day (Dynamic Threshold 1..20)
-#   2. Fixed Softmax Quality Masking (-1e4 masking for both box size & norm threshold)
+#   3. Fixed Softmax Quality Masking (-1e4 masking for both box size & norm threshold)
 #      & Smooth Float Step Decay for Integer Variables.
-#   3. Exact Per-Class Top-2 Margin Filtering (Ratio/Difference Test via scatter_reduce).
-#   4. Track-Level Quality-Weighted Centroid Verification (Post-Confirmation Gate).
-#   5. Continuous Confidence-Weighted Track Scoring & High-Certainty Single-Track Rescue.
+#   4. Exact Per-Class Top-2 Margin Filtering (Ratio/Difference Test via scatter_reduce).
+#   5. Track-Level Quality-Weighted Centroid Verification (Post-Confirmation Gate).
+#   6. Continuous Confidence-Weighted Track Scoring & High-Certainty Single-Track Rescue.
+#   7. Stratified 64-Prototype Gallery Condensation (4 Sub-Centers + 60 Pose-Stratified
+#      Prototypes per class -> ~4,400 vectors total, fitting in A100 L2 Cache).
 # ==============================================================================
 
 import os
@@ -131,7 +135,8 @@ MAX_STAGE1_WORKERS = 4
 GPU_BATCH_SIZE = 512
 AT_BUDGET = 600_000
 SIM_ROW_CHUNK_ELEMS = 1 << 26
-ACTIVE_GPUS = [0, 1, 6, 7]
+PROTOTYPES_PER_CLASS = 64  # 4 Sub-Centers + 60 Pose-Stratified Exemplars per class
+ACTIVE_GPUS = [1, 2, 7]
 
 # ==========================================
 # 2. STANDARDIZED DIRECTORY PATHS
@@ -156,16 +161,48 @@ os.makedirs(SWEEP_OUTPUT_DIR, exist_ok=True)
 
 
 def is_cam1_video(filename):
-    """Returns True if the video filename belongs to Cam1 (matching process_unified_attendance.py)."""
     fname = os.path.basename(filename).lower()
     return 'cam1' in fname or 'cam_1' in fname
 
 
+def condense_gallery_prototypes(ref_tensor, y_real, num_classes, max_per_class=PROTOTYPES_PER_CLASS):
+    """
+    Condenses the 245k gallery into `max_per_class` (64) high-coverage prototypes per student:
+      - Always retains the last 4 vectors (1 Global Class Centroid + 3 Spherical K-Means Sub-Centers
+        appended by train_yolo_sota.py).
+      - Uniformly samples up to `max_per_class - 4` (60) vectors across the student's full gallery
+        enrollment sequence so every head pose, distance, and lighting condition is represented.
+    """
+    condensed_embs = []
+    condensed_y = []
+    y_real_cpu = torch.as_tensor(y_real, dtype=torch.int64, device='cpu')
+    ref_cpu = ref_tensor.detach().cpu().float()
+
+    for c_idx in range(num_classes):
+        c_embs = ref_cpu[y_real_cpu == c_idx]
+        M = c_embs.shape[0]
+        if M == 0:
+            continue
+        if M <= max_per_class:
+            chosen = c_embs
+        else:
+            # Keep the last 4 (Centroid + 3 Sub-Centers) + (max_per_class - 4) stratified across [0, M-4)
+            n_Tail = 4
+            n_Strat = max_per_class - n_Tail
+            raw_pool = c_embs[:-n_Tail]
+            sub_centers = c_embs[-n_Tail:]
+            idx = torch.linspace(0, raw_pool.shape[0] - 1, steps=n_Strat).round().long()
+            chosen = torch.cat([raw_pool[idx], sub_centers], dim=0)
+
+        condensed_embs.append(chosen)
+        condensed_y.extend([c_idx] * chosen.shape[0])
+
+    final_embs = F.normalize(torch.cat(condensed_embs, dim=0), p=2, dim=1)
+    final_y = np.array(condensed_y, dtype=np.int64)
+    return final_embs, final_y
+
+
 def apply_target_metrics(row_dict, target_algo):
-    """
-    Populates Overall_Accuracy, Matches, Total_Valid, TP, TN, FP, FN, and Best_Daily_Threshold
-    from the selected target_algo ('A1', 'A2', 'A3', or 'A4') while keeping all A1..A4 columns intact.
-    """
     t = target_algo.upper()
     row_dict["Target_Algorithm"] = t
     row_dict["Overall_Accuracy"] = float(row_dict.get(f"{t}_Accuracy", 0.0))
@@ -189,13 +226,6 @@ def apply_target_metrics(row_dict, target_algo):
 
 
 def is_better_candidate(cand_row, best_row, target_algo):
-    """
-    Multi-level tie-breaker:
-      1. Target Algorithm Accuracy
-      2. Target Algorithm TP
-      3. Target Algorithm -FP
-      4. Secondary Algorithm Accuracy (A1 if optimizing A2/A4; A2 if optimizing A1/A3)
-    """
     if best_row is None:
         return True
     t = target_algo.upper()
@@ -216,7 +246,6 @@ def is_better_candidate(cand_row, best_row, target_algo):
 
 
 def format_all_algos_inline(row_dict, target_algo=None):
-    """Formats a compact inline string showing A1, A2, A3, A4 accuracies simultaneously."""
     if not row_dict:
         return "A1:-- | A2:-- | A3:-- | A4:--"
     a1 = float(row_dict.get("A1_Accuracy", 0.0))
@@ -387,7 +416,6 @@ def write_live_progress(sweep_dir, pid, target_algo, epoch, max_epochs, complete
 
 
 def param_key(p):
-    """Canonical hashable key for parameter dictionary (with rounding to avoid float drift)."""
     return (
         round(float(p["CONFIDENCE_THRESHOLD"]), 4),
         round(float(p["NORM_QUALITY_THRESHOLD"]), 4),
@@ -405,7 +433,7 @@ def param_key(p):
 
 
 # ==========================================
-# 4. VIDEO READER, ALIGNMENT & MODELS (STAGE 1)
+# 4. VIDEO READER, ALIGNMENT & MODELS (STAGE 1 - OC-SORT)
 # ==========================================
 class ThreadedVideoReader:
     def __init__(self, path, queue_size=128):
@@ -848,7 +876,7 @@ def run_stage1_dashboard(progress_q, total_videos, stop_event):
                     break
 
             table = Table(
-                title=f"[bold cyan]Stage 1: Extracting YOLO + AdaFace Feature Cache ({completed}/{total_videos} Videos Ready)[/bold cyan]",
+                title=f"[bold cyan]Stage 1: Extracting YOLO + OC-SORT + AdaFace Feature Cache ({completed}/{total_videos} Videos Ready)[/bold cyan]",
                 box=None
             )
             table.add_column("Video File", style="cyan", width=35)
@@ -903,7 +931,7 @@ def ensure_all_features_cached(target_videos, input_dir, cache_dir, ctx):
         return
 
     ensure_ocsort_tracker()
-    console.print(f"[bold yellow]Extracting YOLO+AdaFace embeddings for {len(missing_cache)} video(s)...[/bold yellow]")
+    console.print(f"[bold yellow]Extracting YOLO+OC-SORT+AdaFace embeddings for {len(missing_cache)} video(s)...[/bold yellow]")
 
     manager = ctx.Manager()
     progress_q = manager.Queue()
@@ -948,7 +976,6 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
     if not os.path.exists(faiss_index_path) or not os.path.exists(meta_path):
         raise FileNotFoundError("Run 'python train_yolo_sota.py' first to build FAISS gallery and metadata!")
 
-    console.print(f"[cyan]  Loading FAISS gallery -> CPU memory...[/cyan]")
     index = faiss.read_index(faiss_index_path)
     index.nprobe = 20
     try:
@@ -957,13 +984,18 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
         index.make_direct_map()
         ref_np = np.array([index.reconstruct(i) for i in range(index.ntotal)])
 
-    ref_embs = F.normalize(torch.from_numpy(ref_np).float(), p=2, dim=1).half()
+    ref_embs_raw = torch.from_numpy(ref_np).float()
 
     with open(meta_path, 'rb') as f:
         meta_data = pickle.load(f)
     target_names = meta_data['target_names']
     y_real       = meta_data['y_real']
     roll_names   = [short_to_roll.get(n.strip(), n.strip()) for n in target_names]
+
+    console.print(f"[cyan]  Condensing FAISS gallery ({len(ref_np):,} embs) -> {PROTOTYPES_PER_CLASS} stratified prototypes/student...[/cyan]")
+    ref_embs_f32, y_real = condense_gallery_prototypes(ref_embs_raw, y_real, len(target_names), PROTOTYPES_PER_CLASS)
+    ref_embs = ref_embs_f32.half()
+    console.print(f"[bold green]  -> Gallery condensed to {ref_embs.shape[0]:,} prototypes! Fits in A100 L2 cache for ~10s/epoch speed.[/bold green]")
 
     console.print(f"[cyan]  Loading feature caches for {len(target_videos)} videos -> CPU memory...[/cyan]")
     cpu_videos = []
@@ -1026,8 +1058,6 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
 
 @torch.no_grad()
 def _fpv_info(bank, fpv):
-    """Per-FRAMES_PER_VOTE track ordering (cached). Tracks are sorted by window count (desc) so that at
-    window step w the still-active tracks are always a *prefix* -> no masking / no Python per-track loop."""
     cache = bank['fpv_cache']
     if fpv in cache:
         return cache[fpv]
@@ -1062,16 +1092,6 @@ def _fpv_info(bank, fpv):
 
 @torch.no_grad()
 def _chunked_top2_class_sim(q, ref_t, y_real_t, n_classes):
-    """
-    Computes exact Top-1 and Top-2 distinct-class similarities for each query row in q (R, 512).
-    Because each student has ~3,500 vectors in the gallery, raw topk(2) over ref_t would return two
-    vectors of the SAME student. Using scatter_reduce(reduce='amax') over y_real_t gives exact
-    per-student max similarity (R, n_classes) before taking topk(2).
-    Returns:
-      top1_sim: (R,)
-      top2_sim: (R,)
-      top1_cls: (R,)
-    """
     R = q.shape[0]
     G = ref_t.shape[1]
     rows_per = max(1, SIM_ROW_CHUNK_ELEMS // max(G, 1))
@@ -1096,10 +1116,6 @@ def _chunked_top2_class_sim(q, ref_t, y_real_t, n_classes):
 
 @torch.no_grad()
 def _chunked_class_sim_for_winners(q, ref_t, y_real_t, target_cls, n_classes):
-    """
-    Computes the exact cosine similarity between each track's global centroid q (R, 512)
-    and its winning student class `target_cls` (R,).
-    """
     R = q.shape[0]
     if R == 0:
         return torch.empty(0, dtype=q.dtype, device=q.device)
@@ -1127,14 +1143,6 @@ def _eval_fpv_group(
     presence_all, presence_cam1, daily_counts_all, daily_counts_cam1,
     n_classes, at_budget, live
 ):
-    """
-    Evaluates every combo in `grp` (all sharing FRAMES_PER_VOTE=fpv) against ALL tracks at once.
-    Includes:
-      - Bug A Fix: -1e4 masking for frames failing box size OR norm quality threshold.
-      - Upgrade 1: Exact Per-Class Top-2 Margin Filtering (top1_sim - top2_sim >= MARGIN_THRESHOLD).
-      - Upgrade 2: Continuous Confidence-Weighted Daily Scoring & High-Certainty Single-Track Rescue.
-      - Upgrade 3: Track-Level Centroid Verification (Post-Confirmation Gate).
-    """
     info = _fpv_info(bank, fpv)
     if info is None:
         return
@@ -1193,7 +1201,6 @@ def _eval_fpv_group(
             bw     = bw_flat[idx].unsqueeze(1)                                   # (n, 1, fpv)
             bh     = bh_flat[idx].unsqueeze(1)
 
-            # ---- BUG A FIX: Mask out BOTH small boxes and low-norm frames with -1e4 before Softmax ----
             frame_ok = (bw >= mbs) & (bh >= mbs) & (nrm.unsqueeze(1) >= nth)     # (n, A, fpv)
             valid    = frame_ok.any(dim=2)                                       # (n, A)
 
@@ -1201,7 +1208,6 @@ def _eval_fpv_group(
             weights = torch.softmax(logits, dim=2).to(cdt)                       # (n, A, fpv)
             e_win   = F.normalize(torch.bmm(weights, w_embs), p=2, dim=2)        # (n, A, 512)
 
-            # Accumulate quality-weighted track centroid over valid frames
             raw_w = (nrm.unsqueeze(1) * frame_ok.float()).to(cdt)                # (n, A, fpv)
             centroid[:n] += torch.bmm(raw_w, w_embs).float()
 
@@ -1211,14 +1217,12 @@ def _eval_fpv_group(
             ema[:n] = torch.where(valid.unsqueeze(2), new, prev)
             inited[:n] |= valid
 
-            # ---- UPGRADE 1: Exact Per-Class Top-2 Margin Filtering ----
             flat = ema[:n].reshape(n * A, 512)
             top1_sim, top2_sim, cls = _chunked_top2_class_sim(flat, ref_embs_t, y_real_t, n_classes)
             sim_diff = (top1_sim - top2_sim).view(n, A)
             is_conf  = (top1_sim.view(n, A) >= conf) & (sim_diff >= marg) & valid
             votes_flat[row_ids[:n * A], cls] += is_conf.reshape(-1).to(torch.int32)
 
-        # ---- Confirm Tracks (Stage 1 Gates) ----
         best_votes, best_cls = votes.max(dim=2)                                  # (Te, A)
         total_valid = votes.sum(dim=2)                                           # (Te, A)
         W_f   = info['W_t'][:Te].unsqueeze(1)                                    # (Te, 1)
@@ -1236,7 +1240,6 @@ def _eval_fpv_group(
 
         t_i, a_i = confirmed.nonzero(as_tuple=True)
         if t_i.numel() > 0:
-            # ---- UPGRADE 3: Track-Level Centroid Verification (Post-Confirmation Gate) ----
             cent_sub = F.normalize(centroid[t_i, a_i], p=2, dim=1).to(cdt)
             win_cls  = best_cls[t_i, a_i]
             cent_sim = _chunked_class_sim_for_winners(cent_sub, ref_embs_t, y_real_t, win_cls, n_classes)
@@ -1253,9 +1256,6 @@ def _eval_fpv_group(
             cam1_mask = info['is_cam1'][:Te][t_i]
             cls_idx   = best_cls[t_i, a_i]
 
-            # ---- UPGRADE 2: Continuous Confidence-Weighted Daily Scoring & Single-Track Rescue ----
-            # High-certainty tracks (2.5x required votes, >=75% win ratio, strong centroid similarity)
-            # receive an extra confidence weight (+1) so single-session 5-min appearances aren't lost at Threshold >= 2
             bv_sel  = best_votes[t_i, a_i].float()
             wr_sel  = win_ratio[t_i, a_i]
             req_s   = P['MIN_TOTAL_SAMPLES'][sub][a_i].float().clamp(min=1.0)
@@ -1267,14 +1267,11 @@ def _eval_fpv_group(
                 torch.tensor(1, dtype=torch.int32, device=dev)
             )
 
-            # A1: Session-level binary presence (Cam1 + Cam2 union)
             presence_all[combo_idx, sess_idx, cls_idx] = True
 
-            # A2: Daily confidence-weighted detection count across all protocols & cameras (Cam1 + Cam2)
             flat_daily_idx = (combo_idx * n_dates + date_idx) * n_classes + cls_idx
             daily_all_flat.index_add_(0, flat_daily_idx, track_weight)
 
-            # A3 & A4: Cam1-only subset
             if cam1_mask.any():
                 c_combo = combo_idx[cam1_mask]
                 c_sess  = sess_idx[cam1_mask]
@@ -1519,7 +1516,6 @@ def evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, device, target_algo=
     daily_counts_all  = daily_counts_all[:, :n_dates, :]
     daily_counts_cam1 = daily_counts_cam1[:, :n_dates, :]
 
-    # ---- A1: Cam1 + Cam2 Union per Protocol Session ----
     a1_tp, a1_tn, a1_fp, a1_fn, a1_matches, a1_valid, a1_match_t = _compute_session_metrics(
         presence_all, bank['gt_present'], bank['gt_valid']
     )
@@ -1532,12 +1528,10 @@ def evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, device, target_algo=
         else:
             a1_proto_accs[p_clean] = [0.0] * B
 
-    # ---- A2: Cam1 + Cam2 Daily Combined (Threshold 1..20) ----
     a2_thr, a2_tp, a2_tn, a2_fp, a2_fn, a2_matches, a2_valid = _compute_daily_threshold_metrics(
         daily_counts_all, bank['gt_daily_present'], bank['gt_daily_valid'], device
     )
 
-    # ---- A3: Cam1 Only per Protocol Session ----
     a3_tp, a3_tn, a3_fp, a3_fn, a3_matches, a3_valid, a3_match_t = _compute_session_metrics(
         presence_cam1, bank['gt_present'], bank['gt_cam1_valid']
     )
@@ -1550,7 +1544,6 @@ def evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, device, target_algo=
         else:
             a3_proto_accs[p_clean] = [0.0] * B
 
-    # ---- A4: Cam1 Only Daily Combined (Threshold 1..20) ----
     a4_thr, a4_tp, a4_tn, a4_fp, a4_fn, a4_matches, a4_valid = _compute_daily_threshold_metrics(
         daily_counts_cam1, bank['gt_daily_present'], bank['gt_daily_cam1_valid'], device
     )
@@ -1941,7 +1934,7 @@ if __name__ == '__main__':
         f"[bold green]Shared Feature Cache:[/bold green] {FEATURE_CACHE_DIR}\n"
         f"[bold magenta]Sweep Output Directory:[/bold magenta] {SWEEP_OUTPUT_DIR}\n"
         f"[bold white]Active Optimization Target:[/bold white] [bold yellow]{ALGO_DESCRIPTIONS[TARGET_ALGORITHM]}[/bold yellow]\n"
-        f"[dim]Upgrades: -1e4 Softmax Masking | Per-Class Top-2 Margin | Track Centroid Gate | High-Cert Rescue[/dim]",
+        f"[dim]Tracker: OC-SORT (custom_ocsort.yaml) | 64-Proto Gallery | -1e4 Masking | Top-2 Margin | Centroid Gate[/dim]",
         title="DGX A100 GPU Hyperparameter Optimizer (Copy PID to SPCLAB-DGX_Utilization.xlsx)",
         expand=False
     ))
@@ -2010,7 +2003,7 @@ if __name__ == '__main__':
         c1_tracks = int(bank['is_cam1_t'].sum().item())
         console.print(
             f"  [bold green]OK cuda:{gpu_id}: {bank['T']:,} total tracks ({c1_tracks:,} Cam1 tracks), "
-            f"{bank['N']:,} embeddings, {bank['n_dates']} dates ({bank['n_sessions']} sessions)[/bold green]"
+            f"{bank['N']:,} embeddings, {bank['n_dates']} dates ({bank['n_sessions']} sessions), gallery={ref_embs_t.shape[1]:,}[/bold green]"
         )
 
     del cpu_videos
@@ -2063,7 +2056,6 @@ if __name__ == '__main__':
     else:
         theta_star = {k: cfg["center"] for k, cfg in ACTIVE_VARS.items()}
 
-    # BUG B FIX: Keep current_steps as smooth floats across epochs; round only when creating integer candidates
     current_steps = {k: float(v["step"]) for k, v in ACTIVE_VARS.items()}
     t_opt_start = time.perf_counter()
 
@@ -2078,7 +2070,6 @@ if __name__ == '__main__':
         for epoch in range(1, MAX_EPOCHS + 1):
             candidates = [dict(theta_star)]
 
-            # 1D coordinate steps: +-1*Delta, +-2*Delta, +-3*Delta across all 12 active variables
             for k, cfg in ACTIVE_VARS.items():
                 delta = current_steps[k]
                 for mult in [-3, -2, -1, 1, 2, 3]:
@@ -2095,7 +2086,6 @@ if __name__ == '__main__':
                     cand[k] = val
                     candidates.append(cand)
 
-            # 2D pairwise interaction steps for TOP6_VARS
             for k1, k2 in itertools.combinations(TOP6_VARS, 2):
                 cfg1, cfg2 = ACTIVE_VARS[k1], ACTIVE_VARS[k2]
                 d1, d2 = current_steps[k1], current_steps[k2]
@@ -2256,7 +2246,6 @@ if __name__ == '__main__':
             if best_params_so_far is not None:
                 theta_star = dict(best_params_so_far)
 
-            # Smooth float step decay across all variables
             for k, cfg in ACTIVE_VARS.items():
                 if cfg["is_int"]:
                     current_steps[k] = max(0.35, current_steps[k] * STEP_DECAY)
