@@ -47,18 +47,18 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # ==========================================
 # 1. HYPERPARAMETERS (Synced with sweep_yolo_sota.py)
 # ==========================================
-CONFIDENCE_THRESHOLD   = 0.4125
+CONFIDENCE_THRESHOLD   = 0.3796
 NORM_QUALITY_THRESHOLD = 7.0
-EMA_MOMENTUM           = 0.708
-FRAMES_PER_VOTE        = 4
+EMA_MOMENTUM           = 0.7018
+FRAMES_PER_VOTE        = 7
 SOFTMAX_TAU            = 5.0
-MIN_BOX_SIZE           = 50.0
+MIN_BOX_SIZE           = 52.6252
 MIN_TOTAL_FRAMES       = 30
 MIN_TOTAL_SAMPLES      = 16
-MIN_SAMPLE_RATIO       = 0.3222
+MIN_SAMPLE_RATIO       = 0.231
 MIN_WIN_RATIO          = 0.3604
-MARGIN_THRESHOLD       = 0.015
-CENTROID_THRESHOLD     = 0.380
+MARGIN_THRESHOLD       = 0.03
+CENTROID_THRESHOLD     = 0.3699
 FRAME_SKIP             = 1
 
 

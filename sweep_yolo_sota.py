@@ -1,22 +1,28 @@
 # pyright: reportMissingImports=false
-# sweep_yolo_sota.py – DGX A100 GPU-Accelerated Hyperparameter Optimizer (Stage 2 - Fast Block GEMM)
+# sweep_yolo_sota.py – DGX A100 GPU-Accelerated Hyperparameter Optimizer (Stage 2 - Exact 1:1 Sync)
 # ==============================================================================
 # Upgrades & Bug Fixes:
-#   1. Zero-Scatter-Reduce 3D Block Gallery (`view(rc, n_classes, K).amax(dim=2)`):
-#      - Eliminates PyTorch FP16 `scatter_reduce_('amax')` atomicCAS spin-lock bottleneck!
-#      - Supports Full 245k Gallery (`--prototypes 0`, ~48-55 min) or 1024-Prototype
-#        Full-Pose Gallery (`--prototypes 1024`, ~28-35 min) with 96.06%+ baseline accuracy.
-#   2. 68x Faster Post-Confirmation Centroid Gate (`_chunked_class_sim_for_winners`):
+#   1. Always Syncs Fresh Ground Truth (`true_attendance_all_videos.csv`) from
+#      `Results/filtered_true_attendance.csv` on every startup (eliminates stale GT drift).
+#   2. Exact Pre-Window `MIN_BOX_SIZE` Filtering (`_fpv_info(bank, fpv, mbs)`):
+#      - Filters frames by `(box_w >= MIN_BOX_SIZE) & (box_h >= MIN_BOX_SIZE)` BEFORE
+#        slicing into windows of `FRAMES_PER_VOTE`, matching `test_yolo_sota.py`'s
+#        `crop_buffer` window boundaries and `total_samples` count 1:1.
+#   3. Zero-Scatter-Reduce 3D Block Gallery (`view(rc, n_classes, K).amax(dim=2)`):
+#      - Default `PROTOTYPES_PER_CLASS = 0` loads 100% of the Full 245k FAISS Gallery!
+#      - Eliminates PyTorch FP16 `scatter_reduce_('amax')` atomicCAS spin-lock bottleneck.
+#   4. 68x Faster Post-Confirmation Centroid Gate (`_chunked_class_sim_for_winners`):
 #      - Multiplies confirmed track centroids ONLY against their winning class gallery block
-#        `ref_by_class[c]` instead of the entire 68-class gallery.
-#   3. FP16 In-Place Scaled Centroid Accumulation & Exact Box-Valid Window Counting (`valid_W`):
-#      - Matches `test_yolo_sota.py` pre-window `MIN_BOX_SIZE` sample counting without
-#        splitting GPU batches by `MIN_BOX_SIZE`.
-#   4. Multi-Algorithm Evaluation & Target Switching (A1, A2, A3, A4).
+#        `ref_by_class[c]` instead of all 68 classes.
+#   5. Multi-Algorithm Evaluation & Target Switching (A1, A2, A3, A4).
+#   6. Multi-GPU Thread-Safe Memory Management & Exact Epoch Resume:
+#      - Removed `expandable_segments:True` and cross-thread `torch.cuda.empty_cache()`
+#        race conditions that caused `cudaErrorIllegalAddress`.
+#      - Evicts `fpv_cache` immediately after each group so VRAM stays flat across all epochs.
+#      - Automatically resumes from `max_epoch + 1` with decayed step sizes.
 # ==============================================================================
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -73,6 +79,7 @@ console = Console()
 # 1. OPTIMIZER CONFIGURATION & ACTIVE VARIABLES
 # ==========================================
 TARGET_ALGORITHM = "A2"
+SYNC_VERSION = 5  # Ensures old CSVs from pre-GT-sync / post-window box filtering are archived
 
 ALGO_DESCRIPTIONS = {
     "A1": "A1 (Cam1+Cam2 Protocol Session Union)",
@@ -81,20 +88,20 @@ ALGO_DESCRIPTIONS = {
     "A4": "A4 (Cam1 Only Daily Combined w/ Threshold 1..20)",
 }
 
-# All 12 parameters unlocked (10 core + MARGIN_THRESHOLD + CENTROID_THRESHOLD)
+# Updated with Best Parameters from Combo #1517 (A2: 97.3739%, A1: 90.9492%, A3: 89.2513%, A4: 96.5861%)
 ACTIVE_VARS = {
-    "CONFIDENCE_THRESHOLD":   {"center": 0.4125, "min": 0.22, "max": 0.65, "step": 0.04,  "is_int": False},
-    "NORM_QUALITY_THRESHOLD": {"center": 7.0,    "min": 3.0,  "max": 14.0, "step": 1.2,   "is_int": False},
-    "EMA_MOMENTUM":           {"center": 0.708,  "min": 0.35, "max": 0.98, "step": 0.07,  "is_int": False},
-    "FRAMES_PER_VOTE":        {"center": 4,      "min": 1,    "max": 12,   "step": 2.0,   "is_int": True},
-    "SOFTMAX_TAU":            {"center": 5.0,    "min": 1.0,  "max": 12.0, "step": 1.5,   "is_int": False},
-    "MIN_BOX_SIZE":           {"center": 50.0,   "min": 45.0, "max": 95.0, "step": 6.0,   "is_int": False},
-    "MIN_TOTAL_FRAMES":       {"center": 30,     "min": 10,   "max": 80,   "step": 8.0,   "is_int": True},
-    "MIN_TOTAL_SAMPLES":      {"center": 16,     "min": 4,    "max": 55,   "step": 5.0,   "is_int": True},
-    "MIN_SAMPLE_RATIO":       {"center": 0.3222, "min": 0.10, "max": 0.75, "step": 0.06,  "is_int": False},
-    "MIN_WIN_RATIO":          {"center": 0.3604, "min": 0.20, "max": 0.80, "step": 0.06,  "is_int": False},
-    "MARGIN_THRESHOLD":       {"center": 0.015,  "min": 0.00, "max": 0.12, "step": 0.015, "is_int": False},
-    "CENTROID_THRESHOLD":     {"center": 0.380,  "min": 0.20, "max": 0.60, "step": 0.04,  "is_int": False},
+    "CONFIDENCE_THRESHOLD":   {"center": 0.3796,  "min": 0.22, "max": 0.65, "step": 0.04,  "is_int": False},
+    "NORM_QUALITY_THRESHOLD": {"center": 7.0,     "min": 3.0,  "max": 14.0, "step": 1.2,   "is_int": False},
+    "EMA_MOMENTUM":           {"center": 0.7018,  "min": 0.35, "max": 0.98, "step": 0.07,  "is_int": False},
+    "FRAMES_PER_VOTE":        {"center": 7,       "min": 1,    "max": 12,   "step": 2.0,   "is_int": True},
+    "SOFTMAX_TAU":            {"center": 5.0,     "min": 1.0,  "max": 12.0, "step": 1.5,   "is_int": False},
+    "MIN_BOX_SIZE":           {"center": 52.6252, "min": 45.0, "max": 95.0, "step": 6.0,   "is_int": False},
+    "MIN_TOTAL_FRAMES":       {"center": 30,      "min": 10,   "max": 80,   "step": 8.0,   "is_int": True},
+    "MIN_TOTAL_SAMPLES":      {"center": 16,      "min": 4,    "max": 55,   "step": 5.0,   "is_int": True},
+    "MIN_SAMPLE_RATIO":       {"center": 0.231,   "min": 0.10, "max": 0.75, "step": 0.06,  "is_int": False},
+    "MIN_WIN_RATIO":          {"center": 0.3604,  "min": 0.20, "max": 0.80, "step": 0.06,  "is_int": False},
+    "MARGIN_THRESHOLD":       {"center": 0.03,    "min": 0.00, "max": 0.12, "step": 0.015, "is_int": False},
+    "CENTROID_THRESHOLD":     {"center": 0.3699,  "min": 0.20, "max": 0.60, "step": 0.04,  "is_int": False},
 }
 
 TOP6_VARS = [
@@ -129,9 +136,9 @@ BASE_MIN_BOX_SIZE = 45.0
 FRAME_SKIP = 1
 MAX_STAGE1_WORKERS = 4
 GPU_BATCH_SIZE = 512
-AT_BUDGET = 600_000
-SIM_ROW_CHUNK_ELEMS = 1 << 27
-PROTOTYPES_PER_CLASS = 1024  # 1024 = ~28-35 min run w/ full pose coverage; set 0 for Full 245k Gallery (~50 min)
+AT_BUDGET = 400_000
+SIM_ROW_CHUNK_ELEMS = 1 << 25  # Safe 33.5M element limit (~67MB FP16 buffer, zero int32 overflow risk)
+PROTOTYPES_PER_CLASS = 0       # 0 = Full 245k FAISS Gallery (exact 1:1 match with test_yolo_sota.py)
 ACTIVE_GPUS = [1, 2, 7]
 
 # ==========================================
@@ -166,10 +173,6 @@ def build_structured_gallery_block(ref_tensor, y_real, num_classes, max_per_clas
     Organizes the FAISS gallery into a contiguous 3D block `(num_classes, K_per_class, 512)`
     so per-class max similarity can be computed via `sim.view(rc, num_classes, K).amax(dim=2)`
     with ZERO `scatter_reduce_` atomic contention!
-      - If `max_per_class <= 0`: uses 100% of the full gallery (`K_per_class = max_count_across_classes`),
-        padding shorter classes with their own global centroid so `.amax(dim=2)` is bit-for-bit exact.
-      - If `max_per_class > 0`: retains the last 4 sub-center/centroid vectors + `max_per_class - 4`
-        uniformly stratified pose exemplars per student.
     """
     y_real_cpu = torch.as_tensor(y_real, dtype=torch.int64, device='cpu')
     ref_cpu = F.normalize(ref_tensor.detach().cpu().float(), p=2, dim=1)
@@ -204,7 +207,6 @@ def build_structured_gallery_block(ref_tensor, y_real, num_classes, max_per_clas
         c_half = c_embs.half()
         block[c_idx, :M] = c_half
         if M < K_per_class:
-            # Pad remaining slots with the student's own last vector (centroid) so max() is unchanged
             block[c_idx, M:] = c_half[-1:].expand(K_per_class - M, 512)
 
     return block, K_per_class
@@ -319,22 +321,13 @@ def prepare_subset_true_attendance(target_videos, results_base_dir, sweep_dir, b
     available_dates = [d for d in required_dates if d in full_df_cols]
     missing_dates = [d for d in required_dates if d not in full_df_cols]
 
-    need_create = True
-    if os.path.exists(subset_true_path):
-        existing_df = pd.read_csv(subset_true_path)
-        existing_cols = [str(c).strip().replace('-', '') for c in existing_df.columns]
-        if all(d in existing_cols for d in available_dates):
-            console.print(f"[bold green]OK True Attendance for all videos already exists:[/bold green] {subset_true_path}")
-            need_create = False
+    if missing_dates:
+        console.print(f"[bold yellow]Note:[/bold yellow] {len(missing_dates)} video dates not found in filtered_true_attendance.csv (skipped during evaluation).")
 
-    if need_create:
-        if missing_dates:
-            console.print(f"[bold yellow]Note:[/bold yellow] {len(missing_dates)} video dates not found in filtered_true_attendance.csv (skipped during evaluation).")
-
-        base_cols = list(full_df.columns[:2])
-        subset_df = full_df[base_cols + available_dates].copy()
-        subset_df.to_csv(subset_true_path, index=False)
-        console.print(f"[bold green]OK Saved True Attendance to:[/bold green] {subset_true_path}")
+    base_cols = list(full_df.columns[:2])
+    subset_df = full_df[base_cols + available_dates].copy()
+    subset_df.to_csv(subset_true_path, index=False)
+    console.print(f"[bold green]OK Synced Fresh True Attendance from filtered_true_attendance.csv to:[/bold green] {subset_true_path}")
 
     true_df = pd.read_csv(subset_true_path)
     roll_col = true_df.iloc[:, 0].astype(str).str.strip()
@@ -1082,26 +1075,53 @@ def _load_gpu_sweep_data(target_videos, cache_dir, base_dir, short_to_roll, true
 
 
 @torch.no_grad()
-def _fpv_info(bank, fpv):
+def _fpv_info(bank, fpv, mbs=50.0):
+    """
+    Pre-filters frames by (box_w >= mbs) & (box_h >= mbs) BEFORE slicing into windows of `fpv`,
+    matching test_yolo_sota.py's crop_buffer window formation and total_samples 1:1.
+    """
+    key = (int(fpv), round(float(mbs), 4))
     cache = bank['fpv_cache']
-    if fpv in cache:
-        return cache[fpv]
-    lens = bank['lens_np']
-    ok = np.nonzero(lens >= fpv)[0]
-    if ok.size == 0:
-        cache[fpv] = None
+    if key in cache:
+        return cache[key]
+
+    dev = bank['device']
+    if bank['T'] == 0:
+        cache[key] = None
         return None
-    W = lens[ok] // fpv
+
+    bw_np = bank['bw_np']
+    bh_np = bank['bh_np']
+    starts_np = bank['starts_np']
+    lens_np = bank['lens_np']
+
+    valid_mask_np = (bw_np >= mbs) & (bh_np >= mbs)
+    valid_indices_all = np.nonzero(valid_mask_np)[0].astype(np.int64)
+
+    csum = np.empty(len(valid_mask_np) + 1, dtype=np.int64)
+    csum[0] = 0
+    np.cumsum(valid_mask_np, out=csum[1:])
+    valid_lens = csum[starts_np + lens_np] - csum[starts_np]
+
+    ok = np.nonzero(valid_lens >= fpv)[0]
+    if ok.size == 0:
+        cache[key] = None
+        return None
+
+    W = valid_lens[ok] // fpv
     order = np.argsort(-W, kind='stable')
     sel = ok[order]
     W_s = W[order]
     Wmax = int(W_s[0])
     asc = np.ascontiguousarray(W_s[::-1])
     n_gt = len(W_s) - np.searchsorted(asc, np.arange(Wmax), side='right')
-    dev = bank['device']
+
+    v_starts_sel = csum[starts_np[sel]]
     tidx = torch.from_numpy(sel).to(dev)
+
     info = {
-        'starts': bank['starts_t'][tidx],
+        'v_starts': torch.from_numpy(v_starts_sel).to(dev),
+        'valid_idx_map': torch.from_numpy(valid_indices_all).to(dev),
         'W_t': torch.from_numpy(W_s).to(dev),
         'W_np': W_s,
         'alive': bank['alive_t'][tidx],
@@ -1111,7 +1131,7 @@ def _fpv_info(bank, fpv):
         'n_gt': n_gt,
         'Wmax': Wmax,
     }
-    cache[fpv] = info
+    cache[key] = info
     return info
 
 
@@ -1165,11 +1185,11 @@ def _chunked_class_sim_for_winners(q, ref_by_class, target_cls, n_classes):
 
 @torch.no_grad()
 def _eval_fpv_group(
-    bank, ref_embs_t, ref_by_class, k_per_class, fpv, grp, P,
+    bank, ref_embs_t, ref_by_class, k_per_class, fpv, mbs_val, grp, P,
     presence_all, presence_cam1, daily_counts_all, daily_counts_cam1,
     n_classes, at_budget, live
 ):
-    info = _fpv_info(bank, fpv)
+    info = _fpv_info(bank, fpv, mbs_val)
     if info is None:
         return
     dev = bank['device']
@@ -1180,11 +1200,11 @@ def _eval_fpv_group(
     if Te == 0:
         return
 
-    starts = info['starts'][:Te]
+    v_starts = info['v_starts'][:Te]
+    valid_idx_map = info['valid_idx_map']
     n_gt = info['n_gt']
     Wmax = info['Wmax']
     embs_flat, norms_flat = bank['embs'], bank['norms']
-    bw_flat, bh_flat = bank['box_w'], bank['box_h']
     ar_f = torch.arange(fpv, device=dev)
 
     n_dates = daily_counts_all.shape[1]
@@ -1196,11 +1216,10 @@ def _eval_fpv_group(
         sub = grp[a0:a0 + A_chunk]
         A = sub.numel()
 
-        mbs   = P['MIN_BOX_SIZE'][sub].view(1, A, 1)
         nth   = P['NORM_QUALITY_THRESHOLD'][sub].view(1, A, 1)
         tau   = P['SOFTMAX_TAU'][sub].view(1, A, 1)
-        mom   = P['EMA_MOMENTUM'][sub].to(cdt).view(1, A, 1)
-        inv   = (1.0 - P['EMA_MOMENTUM'][sub]).to(cdt).view(1, A, 1)
+        mom   = P['EMA_MOMENTUM'][sub].view(1, A, 1)
+        inv   = (1.0 - P['EMA_MOMENTUM'][sub]).view(1, A, 1)
         conf  = P['CONFIDENCE_THRESHOLD'][sub].to(cdt).view(1, A)
         marg  = P['MARGIN_THRESHOLD'][sub].to(cdt).view(1, A)
         cthr  = P['CENTROID_THRESHOLD'][sub].to(cdt)
@@ -1208,7 +1227,6 @@ def _eval_fpv_group(
         ema      = torch.zeros(Te, A, 512, dtype=cdt, device=dev)
         centroid = torch.zeros(Te, A, 512, dtype=cdt, device=dev)  # FP16 in-place (scaled by 0.01)
         inited   = torch.zeros(Te, A, dtype=torch.bool, device=dev)
-        valid_W  = torch.zeros(Te, A, dtype=torch.int32, device=dev)
         votes    = torch.zeros(Te, A, n_classes, dtype=torch.int32, device=dev)
         votes_flat = votes.view(Te * A, n_classes)
         row_ids  = torch.arange(Te * A, device=dev)
@@ -1221,28 +1239,25 @@ def _eval_fpv_group(
             live['tracks'] = n
             live['rows_done'] += n * A
 
-            idx    = starts[:n].unsqueeze(1) + (w * fpv) + ar_f.unsqueeze(0)     # (n, fpv)
+            v_pos  = v_starts[:n].unsqueeze(1) + (w * fpv) + ar_f.unsqueeze(0)   # (n, fpv)
+            idx    = valid_idx_map[v_pos]                                        # (n, fpv) exact pre-filtered frames
             w_embs = embs_flat[idx]                                              # (n, fpv, 512)
             nrm    = norms_flat[idx]                                             # (n, fpv)
-            bw     = bw_flat[idx].unsqueeze(1)                                   # (n, 1, fpv)
-            bh     = bh_flat[idx].unsqueeze(1)
 
-            box_ok   = (bw >= mbs) & (bh >= mbs)                                 # (n, A, fpv)
-            frame_ok = box_ok & (nrm.unsqueeze(1) >= nth)                        # (n, A, fpv)
+            frame_ok = (nrm.unsqueeze(1) >= nth)                                 # (n, A, fpv)
             valid    = frame_ok.any(dim=2)                                       # (n, A)
-            valid_W[:n] += box_ok.any(dim=2).to(torch.int32)
 
             logits  = torch.where(frame_ok, nrm.unsqueeze(1) / tau, -1e4)        # (n, A, fpv)
             weights = torch.softmax(logits, dim=2).to(cdt)                       # (n, A, fpv)
-            e_win   = F.normalize(torch.bmm(weights, w_embs), p=2, dim=2)        # (n, A, 512)
+            e_win   = F.normalize(torch.bmm(weights, w_embs).float(), p=2, dim=2) # (n, A, 512) FP32 normalized
 
             raw_w = (nrm.unsqueeze(1) * (0.01 * frame_ok.float())).to(cdt)       # (n, A, fpv)
             centroid[:n].add_(torch.bmm(raw_w, w_embs))
 
-            prev    = ema[:n]
-            blended = F.normalize(mom * prev + inv * e_win, p=2, dim=2)
-            new     = torch.where(inited[:n].unsqueeze(2), blended, e_win)
-            ema[:n] = torch.where(valid.unsqueeze(2), new, prev)
+            prev    = ema[:n].float()
+            blended = F.normalize(mom * prev + inv * e_win, p=2, dim=2).to(cdt)
+            new     = torch.where(inited[:n].unsqueeze(2), blended, e_win.to(cdt))
+            ema[:n] = torch.where(valid.unsqueeze(2), new, ema[:n])
             inited[:n] |= valid
 
             flat = ema[:n].reshape(n * A, 512)
@@ -1253,12 +1268,12 @@ def _eval_fpv_group(
 
         best_votes, best_cls = votes.max(dim=2)                                  # (Te, A)
         total_valid = votes.sum(dim=2)                                           # (Te, A)
-        W_f   = valid_W.float().clamp(min=1.0)                                   # (Te, A)
+        W_f   = info['W_t'][:Te].unsqueeze(1)                                    # (Te, 1) exact pre-window count
         alive = info['alive'][:Te].unsqueeze(1)
 
         alive_ok     = alive >= P['MIN_TOTAL_FRAMES'][sub].view(1, A)
-        samples_ok   = valid_W >= P['MIN_TOTAL_SAMPLES'][sub].view(1, A)
-        sample_ratio = best_votes.float() / W_f
+        samples_ok   = W_f >= P['MIN_TOTAL_SAMPLES'][sub].view(1, A)
+        sample_ratio = best_votes.float() / W_f.float().clamp(min=1)
         win_ratio    = best_votes.float() / total_valid.float().clamp(min=1)
         confirmed = (
             alive_ok & samples_ok & (total_valid > 0)
@@ -1311,7 +1326,7 @@ def _eval_fpv_group(
                 flat_cam1_idx = (c_combo * n_dates + c_date) * n_classes + c_cls
                 daily_cam1_flat.index_add_(0, flat_cam1_idx, c_w)
 
-        del ema, centroid, inited, valid_W, votes, votes_flat, row_ids, best_votes, best_cls, total_valid, confirmed
+        del ema, centroid, inited, votes, votes_flat, row_ids, best_votes, best_cls, total_valid, confirmed
 
 
 @torch.no_grad()
@@ -1412,6 +1427,9 @@ def build_track_bank(cpu_videos, true_dict, roll_names, y_real, device, min_fram
         'device': device, 'dtype': dtype,
         'T': len(lens), 'N': cursor,
         'embs': embs, 'norms': norms, 'box_w': bw, 'box_h': bh,
+        'bw_np': bw.detach().cpu().numpy(),
+        'bh_np': bh.detach().cpu().numpy(),
+        'starts_np': np.asarray(starts, dtype=np.int64),
         'lens_np': np.asarray(lens, dtype=np.int64),
         'starts_t':  torch.tensor(starts,    dtype=torch.int64, device=device),
         'alive_t':   torch.tensor(alive,     dtype=torch.int64, device=device),
@@ -1509,34 +1527,32 @@ def evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, ref_by_class, k_per_
     daily_counts_cam1 = torch.zeros(B, max(n_dates, 1),    n_classes, dtype=torch.int32, device=device)
 
     if n_sessions > 0 and bank['T'] > 0:
-        fpv_list = [int(p['FRAMES_PER_VOTE']) for _, p in combo_batch]
+        fpv_mbs_list = [(int(p['FRAMES_PER_VOTE']), round(float(p['MIN_BOX_SIZE']), 4)) for _, p in combo_batch]
+        unique_fpv_mbs = sorted(set(fpv_mbs_list))
 
         groups = []
-        for fpv in sorted(set(fpv_list)):
-            grp = torch.tensor([i for i, f in enumerate(fpv_list) if f == fpv], dtype=torch.int64, device=device)
-            info = _fpv_info(bank, fpv)
-            if info is None:
-                continue
-            min_s = int(P['MIN_TOTAL_SAMPLES'][grp].min().item())
-            Te = int((info['W_np'] >= min_s).sum())
-            if Te == 0:
-                continue
-            work = int(grp.numel()) * int(np.minimum(info['n_gt'], Te).sum())
-            groups.append((fpv, grp, work, info['Wmax']))
+        for fpv, mbs_val in unique_fpv_mbs:
+            grp = torch.tensor(
+                [i for i, fm in enumerate(fpv_mbs_list) if fm == (fpv, mbs_val)],
+                dtype=torch.int64, device=device
+            )
+            groups.append((fpv, mbs_val, grp))
 
         live = {
             'phase': 'running',
             'rows_done': 0,
-            'rows_total': max(1, sum(g[2] for g in groups)),
+            'rows_total': max(1, B * bank['T'] * 10),
             't0': time.perf_counter(),
         }
         LIVE_STATUS[tag] = live
-        for gi, (fpv, grp, work, Wmax) in enumerate(groups, start=1):
+        for gi, (fpv, mbs_val, grp) in enumerate(groups, start=1):
             _eval_fpv_group(
-                bank, ref_embs_t, ref_by_class, k_per_class, fpv, grp, P,
+                bank, ref_embs_t, ref_by_class, k_per_class, fpv, mbs_val, grp, P,
                 presence_all, presence_cam1, daily_counts_all, daily_counts_cam1,
                 n_classes, at_budget, live
             )
+            # Evict the single group's fpv_cache entry so VRAM usage remains strictly constant
+            bank['fpv_cache'].clear()
         live['phase'] = 'finalising'
 
     presence_all      = presence_all[:, :n_sessions, :]
@@ -1572,7 +1588,7 @@ def evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, ref_by_class, k_per_
         else:
             a3_proto_accs[p_clean] = [0.0] * B
 
-    a4_thr, a4_tp, a4_tn, a4_fp, a4_fn, a4_matches, a4_valid = _compute_daily_threshold_metrics(
+    a4_thr, a4_tp, a4_tn, a4_fp, a4_fn, a4_matches, a4_matches_valid = _compute_daily_threshold_metrics(
         daily_counts_cam1, bank['gt_daily_present'], bank['gt_daily_cam1_valid'], device
     )
 
@@ -1581,12 +1597,13 @@ def evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, ref_by_class, k_per_
         a1_acc = (a1_matches[b_i] / a1_valid * 100.0) if a1_valid > 0 else 0.0
         a2_acc = (a2_matches[b_i] / a2_valid * 100.0) if a2_valid > 0 else 0.0
         a3_acc = (a3_matches[b_i] / a3_valid * 100.0) if a3_valid > 0 else 0.0
-        a4_acc = (a4_matches[b_i] / a4_valid * 100.0) if a4_valid > 0 else 0.0
+        a4_acc = (a4_matches[b_i] / a4_matches_valid * 100.0) if a4_matches_valid > 0 else 0.0
 
         res = {
             "Combo_ID": combo_id,
             **params,
             "Gallery_Prototypes": PROTOTYPES_PER_CLASS,
+            "Sync_Version": SYNC_VERSION,
             "Target_Algorithm": target_algo,
             "A1_Accuracy": round(a1_acc, 4),
             "A2_Accuracy": round(a2_acc, 4),
@@ -1612,7 +1629,7 @@ def evaluate_combo_batch_gpu(combo_batch, bank, ref_embs_t, ref_by_class, k_per_
             "A3_Matches": a3_matches[b_i], "A3_Valid": a3_valid,
             "A3_TP": a3_tp[b_i], "A3_TN": a3_tn[b_i], "A3_FP": a3_fp[b_i], "A3_FN": a3_fn[b_i],
 
-            "A4_Matches": a4_matches[b_i], "A4_Valid": a4_valid,
+            "A4_Matches": a4_matches[b_i], "A4_Valid": a4_matches_valid,
             "A4_TP": a4_tp[b_i], "A4_TN": a4_tn[b_i], "A4_FP": a4_fp[b_i], "A4_FN": a4_fn[b_i],
         })
 
@@ -1653,7 +1670,7 @@ def get_compact_gpu_summary():
             total_sum += t
             el = time.perf_counter() - st.get('t0', time.perf_counter())
             if d > 0 and el > 1.0:
-                eta = el * (t - d) / d
+                eta = el * max(0, t - d) / d
                 if eta > max_eta_sec:
                     max_eta_sec = eta
         elif phase in ('finalising', 'idle'):
@@ -1706,9 +1723,15 @@ def worker_evaluate_chunk(chunk, gpu_id, target_algo):
                         combo_batch, bank, ref_embs_t, ref_by_class, k_per_class, device, target_algo, budget, gpu_id
                     )
                     break
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    if budget <= 2000:
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    err_msg = str(e)
+                    is_oom_or_cublas = (
+                        isinstance(e, torch.cuda.OutOfMemoryError)
+                        or "CUBLAS_STATUS" in err_msg
+                        or "out of memory" in err_msg.lower()
+                    )
+                    bank['fpv_cache'].clear()
+                    if not is_oom_or_cublas or budget <= 2000:
                         raise
                     budget //= 2
             RESULT_Q.put(batch_results)
@@ -1954,7 +1977,7 @@ if __name__ == '__main__':
         "--prototypes", "-p",
         type=int,
         default=PROTOTYPES_PER_CLASS,
-        help="Prototypes per class (1024 = ~30m fast full-pose mode; 0 = Full 245k FAISS gallery ~50m)"
+        help="Prototypes per class (0 = Full 245k FAISS gallery; 1024 = fast condensed mode)"
     )
     parser.add_argument(
         "--rebuild-cache",
@@ -1976,7 +1999,7 @@ if __name__ == '__main__':
         f"[bold green]Shared Feature Cache:[/bold green] {FEATURE_CACHE_DIR}\n"
         f"[bold magenta]Sweep Output Directory:[/bold magenta] {SWEEP_OUTPUT_DIR}\n"
         f"[bold white]Active Optimization Target:[/bold white] [bold yellow]{ALGO_DESCRIPTIONS[TARGET_ALGORITHM]}[/bold yellow]\n"
-        f"[dim]Tracker: ByteTrack (track_buffer=50) | Gallery: {gal_desc} (Zero scatter_reduce) | Top-2 Margin | Centroid Gate[/dim]",
+        f"[dim]Tracker: ByteTrack (track_buffer=50) | Gallery: {gal_desc} | Pre-Window Box Filter | Synced GT[/dim]",
         title="DGX A100 GPU Hyperparameter Optimizer (Copy PID to SPCLAB-DGX_Utilization.xlsx)",
         expand=False
     ))
@@ -2006,7 +2029,7 @@ if __name__ == '__main__':
         console.print("[bold red]No videos found in VIDEOS folder or feature cache![/bold red]")
         sys.exit(0)
 
-    # 2. Extract or load ground truth for all videos
+    # 2. Extract or load fresh ground truth for all videos
     true_df, short_to_roll, base_to_protocol = prepare_subset_true_attendance(
         target_videos, RESULTS_BASE_DIR, SWEEP_OUTPUT_DIR, BASE_DIR
     )
@@ -2054,9 +2077,11 @@ if __name__ == '__main__':
         bank = build_track_bank(cpu_videos, true_dict, roll_names, y_real, dev, MIN_FRAMES_FLOOR)
         GPU_DATA_CACHE[gpu_id] = (bank, ref_embs_t, ref_by_class, k_per_class)
         c1_tracks = int(bank['is_cam1_t'].sum().item())
+        gt_d_pres = int(bank['gt_daily_present'].sum().item())
+        gt_d_val  = int(bank['gt_daily_valid'].sum().item())
         console.print(
             f"  [bold green]OK cuda:{gpu_id}: {bank['T']:,} tracks ({c1_tracks:,} Cam1), "
-            f"{bank['N']:,} embs, {bank['n_dates']} dates ({bank['n_sessions']} sessions), "
+            f"{bank['N']:,} embs, {bank['n_dates']} dates ({gt_d_pres}/{gt_d_val} Present), "
             f"gallery={n_cls}x{k_per_class} ({ref_embs_t.shape[1]:,})[/bold green]"
         )
 
@@ -2069,6 +2094,7 @@ if __name__ == '__main__':
 
     evaluated_cache = {}
     max_combo_id = 0
+    max_completed_epoch = 0
     best_acc_so_far = -1.0
     best_cid_so_far = None
     best_row_so_far = None
@@ -2077,15 +2103,18 @@ if __name__ == '__main__':
     if os.path.exists(final_accuracy_csv):
         try:
             existing_df = pd.read_csv(final_accuracy_csv)
-            required_v4_cols = {
+            required_v5_cols = {
                 "Combo_ID", "A1_Accuracy", "A2_Accuracy", "A3_Accuracy", "A4_Accuracy",
-                "MARGIN_THRESHOLD", "CENTROID_THRESHOLD", "Gallery_Prototypes"
+                "MARGIN_THRESHOLD", "CENTROID_THRESHOLD", "Gallery_Prototypes", "Sync_Version"
             }
             if (
                 not existing_df.empty
-                and required_v4_cols.issubset(set(existing_df.columns))
+                and required_v5_cols.issubset(set(existing_df.columns))
                 and (existing_df["Gallery_Prototypes"] == PROTOTYPES_PER_CLASS).all()
+                and (existing_df["Sync_Version"] == SYNC_VERSION).all()
             ):
+                if "Epoch" in existing_df.columns and existing_df["Epoch"].notna().any():
+                    max_completed_epoch = int(existing_df["Epoch"].max())
                 for _, row in existing_df.iterrows():
                     row_dict = row.to_dict()
                     apply_target_metrics(row_dict, TARGET_ALGORITHM)
@@ -2101,16 +2130,17 @@ if __name__ == '__main__':
                             best_row_so_far = row_dict
                             best_params_so_far = p_dict
                 console.print(
-                    f"[bold cyan]Found {len(evaluated_cache)} already-evaluated v4 combinations in {final_accuracy_csv}. "
-                    f"Resuming for Target {TARGET_ALGORITHM} (Best {TARGET_ALGORITHM}: {best_acc_so_far:.2f}% | "
+                    f"[bold cyan]Found {len(evaluated_cache)} already-evaluated v5 combinations (through Epoch {max_completed_epoch}) "
+                    f"in {final_accuracy_csv}. Resuming for Target {TARGET_ALGORITHM} "
+                    f"(Best {TARGET_ALGORITHM}: {best_acc_so_far:.2f}% | "
                     f"{format_all_algos_inline(best_row_so_far, TARGET_ALGORITHM)})...[/bold cyan]"
                 )
             elif not existing_df.empty:
-                backup_csv = os.path.join(SWEEP_OUTPUT_DIR, f"sweep_legacy_prev4_{int(time.time())}.csv")
+                backup_csv = os.path.join(SWEEP_OUTPUT_DIR, f"sweep_legacy_prev5_{int(time.time())}.csv")
                 os.replace(final_accuracy_csv, backup_csv)
                 console.print(
                     f"[bold yellow]Archived previous CSV to {backup_csv} to start fresh with "
-                    f"3D Block Gallery (PROTOTYPES_PER_CLASS={PROTOTYPES_PER_CLASS}).[/bold yellow]"
+                    f"Synced Ground Truth + Pre-Window Box Filter + Full 245k 3D Block Gallery.[/bold yellow]"
                 )
         except Exception as e:
             console.print(f"[bold yellow]Warning reading existing sweep CSV: {e}[/bold yellow]")
@@ -2121,17 +2151,25 @@ if __name__ == '__main__':
         theta_star = {k: cfg["center"] for k, cfg in ACTIVE_VARS.items()}
 
     current_steps = {k: float(v["step"]) for k, v in ACTIVE_VARS.items()}
+    start_epoch = min(max(1, max_completed_epoch + 1), MAX_EPOCHS)
+    for _ in range(1, start_epoch):
+        for k, cfg in ACTIVE_VARS.items():
+            if cfg["is_int"]:
+                current_steps[k] = max(0.35, current_steps[k] * STEP_DECAY)
+            else:
+                current_steps[k] = max(0.003, round(current_steps[k] * STEP_DECAY, 5))
+
     t_opt_start = time.perf_counter()
 
     num_sessions = GPU_DATA_CACHE[ACTIVE_GPUS[0]][0]['n_sessions'] if ACTIVE_GPUS else 0
     num_dates    = GPU_DATA_CACHE[ACTIVE_GPUS[0]][0]['n_dates'] if ACTIVE_GPUS else 0
-    console.print(f"\n[bold white]Starting 12-Variable Unified A1/A2/A3/A4 Optimizer (MAX_EPOCHS={MAX_EPOCHS}):[/bold white]")
+    console.print(f"\n[bold white]Starting 12-Variable Unified A1/A2/A3/A4 Optimizer (Epochs {start_epoch}..{MAX_EPOCHS}):[/bold white]")
     console.print(f"  * Maximizing Target : [bold yellow]{ALGO_DESCRIPTIONS[TARGET_ALGORITHM]}[/bold yellow]")
     console.print(f"  * Parallel GPUs     : {ACTIVE_GPUS}  |  Batch Size: {GPU_BATCH_SIZE} combos/batch per GPU")
     console.print(f"  * Cached Videos     : {num_cached_videos} across {num_dates} dates / {num_sessions} sessions ({total_cached_frames:,} total frames)\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(ACTIVE_GPUS)) as executor:
-        for epoch in range(1, MAX_EPOCHS + 1):
+        for epoch in range(start_epoch, MAX_EPOCHS + 1):
             candidates = [dict(theta_star)]
 
             for k, cfg in ACTIVE_VARS.items():
